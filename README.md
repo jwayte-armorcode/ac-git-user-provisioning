@@ -163,7 +163,7 @@ Every script reads one env file, `envfile`, holding all credentials — the Armo
 
 ```
 # envfile
-TENANT_URL=https://app.armorcode.com
+TENANT_URL=https://xxxx.armorcode.xxx
 API_TOKEN=your-armorcode-api-token
 GITLAB_PAT=glpat-...
 GITLAB_URL=https://gitlab.com
@@ -237,6 +237,86 @@ python github_team_sync.py --rows 10 --apply
 ```
 
 If the token can see fewer than N repos, `--rows` is just an upper bound — the run processes whatever exists and finishes normally, it isn't a hard requirement to have that many repos.
+
+### What a dry run looks like
+
+`python github_team_sync.py --rows 10` against a tenant where the token can see 7 repos:
+
+```
+[config] new ArmorCode users will be created with role: 'Developer' (from github_team_sync.ini)
+[armorcode] Loading teams, users, sub-products, business units...
+[armorcode] Using business unit: 'Default Organization' (id=4044)
+[armorcode] 29 teams, 7 users with email, 36 sub-products
+
+======================================================================
+  GitHub -> ArmorCode team sync (DRY RUN)
+======================================================================
+
+[github] Fetching and sorting full repo list (by id, for a stable resume order)...
+[github] 7 repo(s) visible to this token
+[resume] No checkpoint found for github — starting from the beginning
+
+[repo] acme-org/add_jira_mappings  (teams: ticketing)
+    members: 3 total, 1 with email, 2 without (cannot provision without email)
+    [info] matched sub-product: add_jira_mappings (id=3392790)
+    [team] ticketing exists (id=132640)
+      [dry_run] would merge scope entries: [{'product': 762317, 'subProduct': [3392790], 'accessOnAllSubProduct': False}]
+      [dry_run] would ensure 2 member(s) on team:
+        - Ana Ruiz <ana.ruiz@example.com>
+        - New Person <new.person@example.com> (would be created)
+    [warn] skipped (no public email, cannot provision): sam-lee (sam-lee), dev-bot (dev-bot)
+
+[repo] acme-org/ac-sdk-v2  (teams: api)
+    members: 1 total, 0 with email, 1 without (cannot provision without email)
+    [info] matched sub-product: ac-sdk-v2 (id=3392789)
+    [team] API exists (id=132604)
+      [dry_run] would merge scope entries: [{'product': 762317, 'subProduct': [3392789], 'accessOnAllSubProduct': False}]
+    [warn] skipped (no public email, cannot provision): dev-bot (dev-bot)
+
+======================================================================
+  Done. 7 repo(s) scanned, 2 had armorcode-team topics.
+======================================================================
+```
+
+Reading this output:
+
+- **Only repos with an `armorcode-team-*` topic are logged.** 5 of the 7 above produced no output at all — they had no team topic and were skipped silently. The `7 repo(s) scanned, 2 had armorcode-team topics` summary is what tells you whether your topic tagging actually landed; a quiet run means "no topics found", not "nothing to do".
+- **`api` matched the existing team `API`.** Team lookup is case-insensitive, because GitHub forces topics to lowercase — so a topic-derived `api` finds an existing `API` instead of creating a duplicate.
+- **Users are listed by name and email**, with `(would be created)` marking anyone not yet in the tenant.
+- **`would merge scope entries` shows the real PUT payload**, with live product and sub-product ids resolved from the tenant.
+- **Nothing is written in a dry run** — no ArmorCode changes, no `sync_checkpoint.json`, no `email_exceptions.csv` rows. The no-email warnings are only logged to that CSV on an `--apply` run.
+
+One limitation: dry run reports what it *would* send, not whether that would change anything. `would merge scope entries` prints even when the team is already scoped to those sub-products — on an `--apply` run the same case prints `[noop] scope already covers these sub-products`. To see real change-vs-no-op, run with `--apply`.
+
+### Apply logging and `--sparse`
+
+`--apply` logs the same per-user and scope detail as a dry run, so a real run leaves an auditable record of exactly which users and scope changed — not just how many. Members added on this run are separated from those already on the team:
+
+```
+[repo] acme-org/add_jira_mappings  (teams: ticketing)
+    members: 4 total, 2 with email, 2 without (cannot provision without email)
+    [info] matched sub-product: add_jira_mappings (id=3392790)
+    [team] ticketing exists (id=132640)
+      [update] scope merged for team 'ticketing'
+        scope entries: [{'product': 762317, 'subProduct': [3392790], 'accessOnAllSubProduct': False}]
+      [update] added 1 new member(s) to team 'ticketing':
+        - new.person@example.com
+      [noop] 1 member(s) already on team:
+        - Ana Ruiz <ana.ruiz@example.com>
+```
+
+Unlike a dry run, apply reports whether each write actually changed anything — `[update]` for a real change, `[noop]` when the team was already scoped or the member was already present.
+
+`--sparse` condenses this to counts only, dropping the indented per-user lists and the scope payload. It applies to dry runs and `--apply` alike. The same repo with `--apply --sparse`:
+
+```
+    [team] ticketing exists (id=132640)
+      [update] scope merged for team 'ticketing'
+      [update] added 1 new member(s) to team 'ticketing'
+      [noop] 1 member(s) already on team
+```
+
+Default (non-sparse) is the right choice for an auditable record; reach for `--sparse` on very large tenants where per-user output would otherwise dominate the log.
 
 ## Safety defaults
 

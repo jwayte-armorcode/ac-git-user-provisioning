@@ -12,3 +12,6 @@ email_exceptions.csv
 # Python
 __pycache__/
 *.pyc
+
+# macOS
+.DS_Store

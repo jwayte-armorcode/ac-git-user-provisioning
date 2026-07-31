@@ -668,6 +668,13 @@ def merge_scope_into_team(ac: ArmorCodeClient, team: dict, new_entries: list[dic
     return body, changed
 
 
+def user_label(user_record: dict) -> str:
+    """Format a user for logging. Existing tenant users often have
+    name == email, so only show the name when it adds something."""
+    name, email = user_record.get("name"), user_record.get("email")
+    return f"{name} <{email}>" if name and name != email else f"{email}"
+
+
 def add_user_to_team(ac: ArmorCodeClient, user_record: dict, team_id: int, role: str) -> bool:
     """Ensure one user belongs to one team, without dropping their other
     team memberships.
@@ -701,7 +708,7 @@ def add_user_to_team(ac: ArmorCodeClient, user_record: dict, team_id: int, role:
 def sync(gh_reader: GitHubTeamReader, state: ArmorCodeState, rows: int | None, dry_run: bool,
          default_role: str = "Developer", repo: str | None = None,
          exceptions_file: str = "email_exceptions.csv", today: str = "",
-         checkpoint_file: str = "sync_checkpoint.json"):
+         checkpoint_file: str = "sync_checkpoint.json", sparse: bool = False):
     ac = state.ac
     mode = "DRY RUN" if dry_run else "APPLY"
     print(f"\n{'='*70}\n  GitHub -> ArmorCode team sync ({mode})\n{'='*70}\n")
@@ -768,6 +775,11 @@ def sync(gh_reader: GitHubTeamReader, state: ArmorCodeState, rows: int | None, d
         # Keep full user records (not just ids) — add_user_to_team() needs
         # each user's cached teamInfo to GET-merge team membership correctly.
         user_records_for_team: list[dict] = []
+        # Dry run can't create users, so a would-be-created user never lands in
+        # user_records_for_team and would be missing from the membership
+        # preview. Track them separately so the preview reflects everyone who
+        # would end up on the team, not just those who already exist.
+        pending_user_labels: list[str] = []
         for m in members_with_email:
             email_lower = m["email"].lower()
             existing = state.users_by_email.get(email_lower)
@@ -777,6 +789,7 @@ def sync(gh_reader: GitHubTeamReader, state: ArmorCodeState, rows: int | None, d
 
             print(f"    [create-user] {m['name']} <{m['email']}>")
             if dry_run:
+                pending_user_labels.append(f"{m['name']} <{m['email']}> (would be created)")
                 continue
             try:
                 created = ac.create_user(name=m["name"], email=m["email"], tenant_role=default_role)
@@ -821,6 +834,8 @@ def sync(gh_reader: GitHubTeamReader, state: ArmorCodeState, rows: int | None, d
                             if changed:
                                 ac.put_team(body)
                                 print(f"      [update] scope merged for team {team_name!r}")
+                                if not sparse:
+                                    print(f"        scope entries: {scope_entries}")
                             else:
                                 print("      [noop] scope already covers these sub-products")
                         except Exception as e:
@@ -828,22 +843,43 @@ def sync(gh_reader: GitHubTeamReader, state: ArmorCodeState, rows: int | None, d
 
             # Membership: always add via add_user_to_team, whether the team
             # was just created (scope-only, no members yet) or already existed.
-            if user_records_for_team:
+            if user_records_for_team or pending_user_labels:
                 if dry_run:
-                    print(f"      [dry_run] would ensure {len(user_records_for_team)} member(s) on team")
+                    labels = [user_label(r) for r in user_records_for_team] + pending_user_labels
+                    print(f"      [dry_run] would ensure {len(labels)} member(s) on team"
+                          f"{'' if sparse else ':'}")
+                    if not sparse:
+                        for label in labels:
+                            print(f"        - {label}")
                 else:
-                    added_count = 0
+                    # Track who was actually added vs already present, so apply
+                    # can name them the way dry run does — a bare "added 2"
+                    # leaves no record of WHICH members changed.
+                    added, already = [], []
                     for record in user_records_for_team:
                         try:
                             if add_user_to_team(ac, record, team["id"], default_role):
-                                added_count += 1
+                                added.append(user_label(record))
+                            else:
+                                already.append(user_label(record))
                         except Exception as e:
                             uid = record.get("userId") or record.get("id")
                             print(f"      [error] failed to add user {uid} to team {team_name!r}: {e}")
-                    if added_count:
-                        print(f"      [update] added {added_count} new member(s) to team {team_name!r}")
+                    if added:
+                        print(f"      [update] added {len(added)} new member(s) to team {team_name!r}:")
+                        if not sparse:
+                            for label in added:
+                                print(f"        - {label}")
+                        if already and not sparse:
+                            print(f"      [noop] {len(already)} member(s) already on team:")
+                            for label in already:
+                                print(f"        - {label}")
                     else:
-                        print("      [noop] all members already on team")
+                        print(f"      [noop] all {len(already)} member(s) already on team"
+                              f"{':' if already and not sparse else ''}")
+                        if already and not sparse:
+                            for label in already:
+                                print(f"        - {label}")
 
             if members_missing_email and not dry_run:
                 email_exceptions.log_exceptions(
@@ -989,6 +1025,14 @@ def main():
                              "github_checkpoint.json / gitlab_checkpoint.json) if both sources "
                              "run around the same time.")
 
+    parser.add_argument("--sparse", action="store_true",
+                        help="Condense logging to counts and summary lines, omitting the "
+                             "per-user names and scope payloads printed by default. Applies "
+                             "to both dry runs and --apply. Useful on very large tenants "
+                             "where full per-user output is too verbose; the default "
+                             "(non-sparse) output is what you want for an auditable record "
+                             "of exactly which users and scope changed.")
+
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument("--dry-run", action="store_true", default=None,
                             help="Print what would happen without writing anything (default)")
@@ -1014,11 +1058,17 @@ def main():
 
     ac_env = load_env_file(ac_env_path)
     ac_token = ac_env.get("API_TOKEN") or ac_env.get("token")
-    ac_url = (ac_env.get("TENANT_URL") or ac_env.get("url") or "https://app.armorcode.com")
-    ac_url = ac_url.replace("https://", "").replace("http://", "")
+    # No default tenant — an unset TENANT_URL must fail loudly rather than
+    # silently targeting some other tenant than the operator intended.
+    ac_url = ac_env.get("TENANT_URL") or ac_env.get("url")
     if not ac_token:
         print(f"[error] no ArmorCode token found in {ac_env_path}")
         sys.exit(1)
+    if not ac_url:
+        print(f"[error] no ArmorCode tenant URL found in {ac_env_path} "
+              f"(expected 'TENANT_URL', e.g. TENANT_URL=https://xxxx.armorcode.xxx)")
+        sys.exit(1)
+    ac_url = ac_url.replace("https://", "").replace("http://", "")
 
     default_role = load_default_role(args.config, args.default_role)
     print(f"[config] new ArmorCode users will be created with role: {default_role!r} "
@@ -1034,7 +1084,7 @@ def main():
     gh_reader = GitHubTeamReader(pat=gh_pat)
     sync(gh_reader, state, rows=args.rows, dry_run=dry_run, default_role=default_role, repo=args.repo,
          exceptions_file=args.exceptions_file, today=date.today().isoformat(),
-         checkpoint_file=args.checkpoint_file)
+         checkpoint_file=args.checkpoint_file, sparse=args.sparse)
 
 
 if __name__ == "__main__":
