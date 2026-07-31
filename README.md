@@ -109,6 +109,36 @@ A hard kill can leave a half-written final line. That row is detected and droppe
 
 `email_exceptions_<source>.csv` is per-source too, for a different reason: it's rewritten whole on every update, so two concurrent runs sharing one path would silently drop each other's rows. Running both sources at once in separate windows is safe on the defaults.
 
+### Skipping unchanged work
+
+Two independent mechanisms, both opt-out-able, for cutting the cost of a repeat run.
+
+**`apply_cache_<source>.json` — skip teams that haven't changed.** After a team is successfully provisioned, its desired state (members, sub-product ids, role) is recorded. The next run skips any team whose desired state is byte-identical, without calling ArmorCode:
+
+```
+[team] Payments  [cached] unchanged since last run — skipped
+
+  [cached] 198 of 200 team(s) unchanged since the last run — skipped without calling ArmorCode.
+           Run with --full to reconcile everything, including any team
+           edited directly in the ArmorCode UI since then.
+```
+
+This is a **fast path, not a source of truth.** The cache knows what the last run provisioned; it cannot know whether ArmorCode still matches. If an admin removes a member from a team in the UI, the cache still says "unchanged" and the drift persists. Three guards bound that:
+
+- Entries are written **only after** that team's API calls succeed — never in bulk at the end, so a partially failed run can't record work it didn't do. A team that errored prints `[cache] not recording … will be retried next run`.
+- The file is stamped with the tenant URL and a schema version; a cache from another tenant or an older layout is rejected wholesale.
+- **`--full` ignores the cache** and reconciles everything. Run it periodically — weekly, say — to repair hand edits.
+
+**`--changed-since YYYY-MM-DD` — skip repos that haven't changed.** Opt-in, and deliberately not the default, because SCM repo timestamps don't move for everything this sync reads:
+
+- A member **publishing their email** changes their user profile, not the repo. This is the one that matters most: anyone sitting in `email_exceptions_<source>.csv` is waiting for exactly that, and a filtered run would never pick them up.
+- Gaining access via a **GitHub org team** or **GitLab parent group** changes the org/group record.
+- A collaborator being **removed** likewise.
+
+So use it for a fast interim pass, not as a replacement for a full run. On GitLab it's a real server-side filter (`last_activity_after`, so fewer pages fetched); on GitHub the full repo list is still paginated and the filter is applied client-side, saving the per-repo calls but not the listing.
+
+It also gets its own spool (`<source>-repos-changed.csv`). The spool resumes by skipping every id at or below the highest recorded, which is only valid for a contiguous walk — a sparse `--changed-since` set would otherwise make a later full run skip lower-numbered repos it never collected.
+
 ### Files
 
 | File | Role |
@@ -118,6 +148,7 @@ A hard kill can leave a half-written final line. That row is detected and droppe
 | `armorcode.py` | ArmorCode REST client, cached tenant state, scope/membership merge helpers |
 | `email_exceptions.py` | Read/write the no-email exception CSV |
 | `repo_spool.py` | Durable per-repo CSV spool, and resume from it |
+| `apply_cache.py` | Cross-run cache of provisioned state, to skip unchanged teams |
 | `set_repo_teams.py` | Bulk topic tagging from a CSV |
 
 ## Marking a repo with a team
@@ -231,6 +262,18 @@ python team_sync.py --source gitlab --apply --reprocess-from-exceptions
 
 # Dump the in-memory picture for review before provisioning anything
 python team_sync.py --source both --dump-json
+
+# Repeat run: teams unchanged since the last run are skipped (see the
+# apply cache below). Fast, but blind to edits made in the ArmorCode UI.
+python team_sync.py --source both --apply
+
+# Periodic reconcile — ignores the cache and re-checks every team.
+# Run this regularly (weekly, say) so hand edits get repaired.
+python team_sync.py --source both --apply --full
+
+# Fast interim pass over only repos touched since a date. Opt-in, and NOT a
+# substitute for a full run — see the caveats below.
+python team_sync.py --source both --apply --changed-since 2026-07-01
 ```
 
 ### `--source both`
@@ -359,6 +402,8 @@ ArmorCode enforces these limits:
 
 The per-endpoint limit is the binding one here: a long run calls the same few endpoints repeatedly (one `get_sub_product` per matched sub-product, one user update per member), so it can exceed 100 RPM on a single endpoint while nowhere near the 2,000 RPM token budget. Requests are therefore paced **per endpoint** at 100 RPM (one every 0.6s), bucketed by URL path with numeric ids collapsed — `/api/sub-product/1` and `/api/sub-product/2` share one budget, matching how the server counts them. Unrelated endpoints don't slow each other down.
 
+Resolved emails are also cached per run. Reading a member's email is a full profile fetch, and the same person usually appears on many repos — without the cache a user on 50 repos costs 50 identical calls to the same rate-limited endpoint. Misses are cached too, since users with no public email are the common case and recur just as often.
+
 If a 429 happens anyway, the run **waits it out and carries on** rather than aborting:
 
 ```
@@ -444,3 +489,5 @@ Default (non-sparse) is the right choice for an auditable record; reach for `--s
 - Sub-products are never created; a repo with no matching sub-product is reported inline *and* re-listed in the run summary, with its team still provisioned, just without that scope.
 - Contributors without a resolvable email are logged to `email_exceptions_<source>.csv`, not dropped.
 - Requests are paced under ArmorCode's per-endpoint rate limit, and a 429 is waited out rather than aborting the run.
+- The apply cache is written only for teams whose API calls succeeded, and `--full` always reconciles from scratch.
+- `--changed-since` is opt-in, never the default, because repo timestamps don't reflect user- or group-side changes.

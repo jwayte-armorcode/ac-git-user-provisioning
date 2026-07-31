@@ -43,8 +43,9 @@ import csv
 import json
 import sys
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 
+import apply_cache
 import email_exceptions
 import repo_spool
 from armorcode import (
@@ -113,7 +114,7 @@ def write_unmatched_csv(path: str, rows: list[dict]) -> None:
 
 def collect(reader, state: ArmorCodeState, rows: int | None, repo: str | None,
             spool_file: str, dry_run: bool, unmatched_repos: list[dict],
-            repos_out: dict) -> tuple[int, int]:
+            repos_out: dict, changed_since=None) -> tuple[int, int]:
     """Read one SCM and accumulate its repo -> {teams, members} mapping.
 
     This phase makes NO ArmorCode writes. It only reads the SCM and resolves
@@ -146,7 +147,7 @@ def collect(reader, state: ArmorCodeState, rows: int | None, repo: str | None,
 
     print(f"[{source}] Fetching and sorting full repo list "
           f"(by id, for a stable resume order)...")
-    all_repos = reader.load_repos(repo=repo)
+    all_repos = reader.load_repos(repo=repo, changed_since=changed_since)
     total_count = len(all_repos)
     print(f"[{source}] {total_count} repo(s) visible to this token")
 
@@ -309,7 +310,7 @@ def write_json_dump(path: str, obj) -> None:
 
 
 def apply_users(ac, state, users: dict, default_role: str, dry_run: bool,
-                sparse: bool) -> dict:
+                sparse: bool, cache=None) -> dict:
     """Create any ArmorCode users that don't exist yet, once per distinct user.
 
     Previously a user appearing on 50 repos was evaluated 50 times. Keyed on
@@ -326,6 +327,8 @@ def apply_users(ac, state, users: dict, default_role: str, dry_run: bool,
         existing = state.users_by_email.get(email)
         if existing:
             records[email] = existing
+            if cache is not None and not dry_run:
+                cache.record_user(email)
             continue
         if dry_run:
             would_create.append(f"{info['name']} <{info['email']}>")
@@ -337,6 +340,8 @@ def apply_users(ac, state, users: dict, default_role: str, dry_run: bool,
             state.users_by_email[email] = rec
             records[email] = rec
             created += 1
+            if cache is not None:
+                cache.record_user(email)   # only after the create succeeded
         except Exception as e:
             print(f"    [error] failed to create user {info['email']}: {e}")
 
@@ -353,7 +358,8 @@ def apply_users(ac, state, users: dict, default_role: str, dry_run: bool,
 
 
 def apply_teams(ac, state, teams: dict, user_records: dict, default_role: str,
-                dry_run: bool, sparse: bool, exceptions_file: str, today: str) -> None:
+                dry_run: bool, sparse: bool, exceptions_file: str, today: str,
+                cache=None) -> None:
     """Provision each team exactly once: create or scope-merge, then members.
 
     This is the efficiency win. Previously the team block ran once per repo,
@@ -364,11 +370,27 @@ def apply_teams(ac, state, teams: dict, user_records: dict, default_role: str,
     """
     print(f"\n{'-'*70}\n  Teams: {len(teams)}\n{'-'*70}")
 
+    skipped_unchanged = 0
+
     for team_name, info in sorted(teams.items()):
         sub_product_ids = sorted(info["sub_product_ids"])
         repo_count = len(info["repos"])
+
+        # Fast path: this team's desired state is identical to what a previous
+        # run successfully provisioned, so every call below would be a no-op.
+        # --full bypasses this (no cache is passed) to reconcile hand edits.
+        if cache is not None and cache.team_unchanged(team_name, info):
+            cache.carry_team(team_name)
+            skipped_unchanged += 1
+            if not sparse:
+                print(f"\n[team] {team_name}  [cached] unchanged since last run — skipped")
+            continue
+
         print(f"\n[team] {team_name}  ({repo_count} repo(s), "
               f"{len(info['members'])} member(s), {len(sub_product_ids)} sub-product(s))")
+        # Any failure below means this team is NOT fully provisioned, so it
+        # must not be cached as done — the next run has to retry it.
+        team_failed = False
 
         # One scope computation for the whole team, not one per repo.
         scope_entries = []
@@ -378,6 +400,7 @@ def apply_teams(ac, state, teams: dict, user_records: dict, default_role: str,
                 scope_entries = state.build_scope_entries(sps)
             except Exception as e:
                 print(f"    [error] failed to resolve parent products for scope: {e}")
+                team_failed = True
 
         team = state.find_team(team_name)
         if team is None:
@@ -397,7 +420,7 @@ def apply_teams(ac, state, teams: dict, user_records: dict, default_role: str,
                     state.register_team(team)
                 except Exception as e:
                     print(f"      [error] failed to create team {team_name!r}: {e}")
-                    continue
+                    continue  # not cached: team_failed is moot, we never got here
         else:
             print(f"    [team] exists (id={team['id']})")
             if scope_entries:
@@ -419,6 +442,7 @@ def apply_teams(ac, state, teams: dict, user_records: dict, default_role: str,
                             print("      [noop] scope already covers these sub-products")
                     except Exception as e:
                         print(f"      [error] failed to merge scope for team {team_name!r}: {e}")
+                        team_failed = True
 
         # Membership, once per (team, user) rather than per (team, user, repo).
         member_records = [user_records[e] for e in sorted(info["members"]) if e in user_records]
@@ -444,6 +468,7 @@ def apply_teams(ac, state, teams: dict, user_records: dict, default_role: str,
                     except Exception as e:
                         uid = record.get("userId") or record.get("id")
                         print(f"      [error] failed to add user {uid} to team {team_name!r}: {e}")
+                        team_failed = True
                 if added:
                     print(f"      [update] added {len(added)} new member(s) to team {team_name!r}:")
                     if not sparse:
@@ -473,12 +498,30 @@ def apply_teams(ac, state, teams: dict, user_records: dict, default_role: str,
                     exceptions_file, src, repo_full, team_name, members, today,
                 )
 
+        # Cache only a team that fully succeeded, and never on a dry run
+        # (nothing was provisioned, so there is nothing to record). Users
+        # that would have been created are absent in dry run, so a dry-run
+        # entry would also under-record the member set.
+        if cache is not None and not dry_run:
+            if team_failed:
+                print(f"      [cache] not recording {team_name!r} — errors above, "
+                      f"will be retried next run")
+            else:
+                cache.record_team(team_name, info)
+
+    if skipped_unchanged:
+        print(f"\n  [cached] {skipped_unchanged} of {len(teams)} team(s) unchanged since "
+              f"the last run — skipped without calling ArmorCode.")
+        print("           Run with --full to reconcile everything, including any team")
+        print("           edited directly in the ArmorCode UI since then.")
+
 
 
 def sync(readers: list, state: ArmorCodeState, rows: int | None, dry_run: bool,
          default_role: str, repo: str | None, exceptions_file: str, today: str,
          spool_files: dict, sparse: bool = False, unmatched_csv: str | None = None,
-         dump_json: bool = False) -> None:
+         dump_json: bool = False, cache_file: str | None = None,
+         tenant_url: str = "", changed_since=None) -> None:
     """Two-phase sync: read every SCM into memory, then provision once per team.
 
     Phase 1 (collect) makes no ArmorCode writes — it reads each SCM and
@@ -505,6 +548,7 @@ def sync(readers: list, state: ArmorCodeState, rows: int | None, dry_run: bool,
             reader, state, rows=rows, repo=repo,
             spool_file=spool_files[reader.source], dry_run=dry_run,
             unmatched_repos=unmatched_repos, repos_out=repos,
+            changed_since=changed_since,
         )
         total_seen += seen
         total_with_teams += with_teams
@@ -517,9 +561,31 @@ def sync(readers: list, state: ArmorCodeState, rows: int | None, dry_run: bool,
         write_json_dump("teams.json", teams)
         print("\n[dump] wrote repos.json, users.json, teams.json")
 
-    user_records = apply_users(state.ac, state, users, default_role, dry_run, sparse)
+    # The cross-run cache is a FAST PATH, never a source of truth — see
+    # apply_cache.py. --full (cache_file=None) skips it entirely and
+    # reconciles every team, which is what repairs drift from hand edits.
+    cache = None
+    if cache_file:
+        cache = apply_cache.ApplyCache(cache_file, tenant_url, default_role)
+        cache.load()
+        if cache.reject_reason:
+            print(f"\n[cache] ignoring {cache_file}: {cache.reject_reason}")
+            print("        every team will be reconciled this run")
+        elif cache.loaded:
+            print(f"\n[cache] loaded {cache_file} — teams unchanged since the last "
+                  f"successful run will be skipped")
+        else:
+            print(f"\n[cache] no cache yet at {cache_file} — reconciling everything")
+
+    user_records = apply_users(state.ac, state, users, default_role, dry_run, sparse,
+                               cache=cache)
     apply_teams(state.ac, state, teams, user_records, default_role, dry_run, sparse,
-                exceptions_file, today)
+                exceptions_file, today, cache=cache)
+
+    # Written only after apply finished. A crash mid-apply leaves the previous
+    # cache in place, so the next run retries rather than assuming success.
+    if cache is not None and not dry_run:
+        cache.save()
 
     print(f"\n{'='*70}")
     print(f"  Done. {total_seen} repo(s) scanned, {total_with_teams} had armorcode-team "
@@ -555,13 +621,17 @@ def sync(readers: list, state: ArmorCodeState, rows: int | None, dry_run: bool,
     #
     # Filtered runs keep their spool: --repo/--rows covered only part of the
     # tenant, so that position isn't a valid "we got this far" marker.
-    if not dry_run and repo is None and rows is None:
+    # --changed-since counts as a filter here too: the run only saw repos
+    # updated since that date, so its position is not a valid "we covered the
+    # whole tenant" marker and the spool must be kept for the next resume.
+    if not dry_run and repo is None and rows is None and changed_since is None:
         for reader in readers:
             repo_spool.RepoSpool(spool_files[reader.source], reader.source).discard()
         print("[resume] Full run completed — spool(s) cleared")
     elif not dry_run:
         kept = ", ".join(spool_files[r.source] for r in readers)
-        print(f"[resume] Filtered run (--repo/--rows) — spool(s) kept: {kept}")
+        print(f"[resume] Filtered run (--repo/--rows/--changed-since) — "
+              f"spool(s) kept: {kept}")
 
 
 def reprocess_exceptions(state: ArmorCodeState, exceptions_file: str, dry_run: bool,
@@ -689,6 +759,35 @@ def main():
                              "since it reports that run rather than accumulating history. "
                              "Written in dry runs too, so it can be used to plan the missing "
                              "sub-products before writing anything.")
+    parser.add_argument("--changed-since", default=None, metavar="YYYY-MM-DD",
+                        help="Only process repos updated at or after this date. OPT-IN and "
+                             "deliberately not the default, because SCM repo timestamps do "
+                             "not move for everything this sync reads: a member publishing "
+                             "their email, gaining access via an org team or parent group, "
+                             "or being removed, all change the USER or GROUP record and "
+                             "leave the repo's timestamp untouched. So a filtered run can "
+                             "miss a contributor who just became provisionable — including "
+                             "anyone sitting in email_exceptions_<source>.csv waiting for "
+                             "exactly that. Use it for a fast interim pass and run a full "
+                             "one regularly. On GitLab this is a server-side filter "
+                             "(fewer pages fetched); on GitHub the full repo list is still "
+                             "paginated and the filter is applied client-side, so it saves "
+                             "the per-repo calls but not the listing.")
+    parser.add_argument("--cache-file", default=None,
+                        help="Path to the cross-run apply cache (default: "
+                             "apply_cache_<source>.json). Records each team's and user's "
+                             "provisioned state after it succeeds, so the next run skips "
+                             "teams whose desired state hasn't changed instead of "
+                             "re-confirming them via the API. A fast path only — it cannot "
+                             "see edits made directly in the ArmorCode UI, so pair it with "
+                             "a periodic --full run.")
+    parser.add_argument("--full", action="store_true",
+                        help="Ignore the apply cache and reconcile every team and user, "
+                             "even if unchanged since the last run. Use this to repair "
+                             "drift from changes made directly in the ArmorCode UI (a "
+                             "member removed from a team, scope edited by hand). Worth "
+                             "running periodically — weekly, say — since the cache alone "
+                             "will never notice such edits.")
     parser.add_argument("--dump-json", action="store_true",
                         help="Write repos.json, users.json and teams.json — the in-memory "
                              "picture built from the SCMs before anything is provisioned. "
@@ -731,9 +830,38 @@ def main():
               "(each SCM needs its own spool; omit the flag to use the "
               "per-source defaults)")
         sys.exit(1)
+    # --changed-since gets its OWN spool namespace. The spool resumes by
+    # skipping every id <= the highest one recorded, which is only valid if
+    # collection walked ids contiguously. --changed-since collects a SPARSE
+    # set (only repos touched since the date), so its high-water mark would
+    # make a later full run skip every lower id — including repos it never
+    # collected because they hadn't changed.
+    spool_suffix = "-changed" if args.changed_since else ""
     spool_files = {
-        s: (args.spool_file or f"{s}-repos.csv") for s in sources
+        s: (args.spool_file or f"{s}-repos{spool_suffix}.csv") for s in sources
     }
+
+    # Parsed as UTC-aware, because GitHub's updated_at is timezone-aware and
+    # comparing it against a naive datetime raises TypeError.
+    changed_since = None
+    if args.changed_since:
+        try:
+            changed_since = datetime.fromisoformat(args.changed_since).replace(
+                tzinfo=timezone.utc)
+        except ValueError:
+            print(f"[error] --changed-since {args.changed_since!r} is not a valid date "
+                  f"(expected YYYY-MM-DD)")
+            sys.exit(1)
+        print(f"[filter] --changed-since {changed_since.date()}: repos not updated since "
+              f"then will be skipped. NOTE this can miss a member who published their "
+              f"email or gained access via a group — the repo timestamp does not change "
+              f"for either. Run without it periodically.")
+
+    # --full disables the cache entirely rather than deleting it: a --full run
+    # still rewrites the cache from what it provisions, so the next ordinary
+    # run gets a fresh fast path.
+    cache_file = None if args.full else (args.cache_file
+                                         or f"apply_cache_{source}.json")
     exceptions_file = args.exceptions_file or f"email_exceptions_{source}.csv"
 
     # One env file holds everything: the qualified key names (GITHUB_PAT vs
@@ -810,7 +938,8 @@ def main():
          repo=args.repo, exceptions_file=exceptions_file,
          today=date.today().isoformat(), spool_files=spool_files,
          sparse=args.sparse, unmatched_csv=args.unmatched_csv,
-         dump_json=args.dump_json)
+         dump_json=args.dump_json, cache_file=cache_file, tenant_url=ac_url,
+         changed_since=changed_since)
 
 
 if __name__ == "__main__":

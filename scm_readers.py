@@ -79,13 +79,21 @@ class GitHubTeamReader:
 
     def __init__(self, pat: str):
         self._gh = Github(pat)
+        # login -> email or None. See _resolve_email().
+        self._email_cache: dict[str, str | None] = {}
 
-    def load_repos(self, repo: str | None = None):
+    def load_repos(self, repo: str | None = None, changed_since=None):
         """All repos the token can see, sorted by id ascending.
 
         repo: optional filter to a single repo as "owner/name"
               (case-insensitive). Fetched directly instead of listing
               everything — for one-off test runs.
+        changed_since: optional datetime; keep only repos whose updated_at is
+              at or after it. GitHub has no server-side filter for this on the
+              repo list, so the full list is still paginated and the filter is
+              applied client-side. That saves the per-repo topic/member calls
+              (the expensive part) but not the initial listing.
+              See the caveats in team_sync.py's --changed-since help.
         """
         if repo is not None:
             try:
@@ -95,6 +103,12 @@ class GitHubTeamReader:
                 return []
 
         repos = list(self._gh.get_user().get_repos(type="all"))
+        if changed_since is not None:
+            before = len(repos)
+            repos = [r for r in repos
+                     if r.updated_at is not None and r.updated_at >= changed_since]
+            print(f"[github] --changed-since: {len(repos)} of {before} repo(s) "
+                  f"updated at or after {changed_since.isoformat()}")
         repos.sort(key=lambda r: r.id)
         return repos
 
@@ -158,11 +172,24 @@ class GitHubTeamReader:
         return list(members.values())
 
     def _resolve_email(self, gh_user) -> str | None:
-        """Best-effort: the user's public email, if they publish one."""
+        """Best-effort: the user's public email, if they publish one.
+
+        Cached per login for the life of the run. This is a full profile
+        fetch, and the same person typically appears on many repos — without
+        the cache a user on 50 repos costs 50 identical API calls against
+        the same rate-limited endpoint. Misses are cached too (as None):
+        users with no public email are the common case, and they recur just
+        as often.
+        """
+        login = gh_user.login
+        if login in self._email_cache:
+            return self._email_cache[login]
         try:
-            return self._gh.get_user(gh_user.login).email or None
+            email = self._gh.get_user(login).email or None
         except GithubException:
-            return None
+            email = None
+        self._email_cache[login] = email
+        return email
 
 
 class GitLabTeamReader:
@@ -172,15 +199,29 @@ class GitLabTeamReader:
     def __init__(self, pat: str, url: str = "https://gitlab.com"):
         self._gl = gitlab.Gitlab(url=url, private_token=pat)
         self._gl.auth()
+        # user id -> email or None. See _resolve_email().
+        self._email_cache: dict[int, str | None] = {}
 
-    def load_repos(self, repo: str | None = None):
+    def load_repos(self, repo: str | None = None, changed_since=None):
         """All projects the token has membership on, sorted by id ascending.
 
         repo: optional filter, matched case-insensitively against either
               the short project path (e.g. "juice-shop") or the full
               "namespace/path".
+        changed_since: optional datetime; passed to the API as
+              last_activity_after, so unlike GitHub this is a real
+              server-side filter and fewer pages are fetched.
+              See the caveats in team_sync.py's --changed-since help.
         """
-        projects = list(self._gl.projects.list(membership=True, all=True, iterator=True))
+        # GitLab DOES support a server-side filter here, so --changed-since
+        # genuinely reduces how many pages are fetched, unlike GitHub.
+        list_kwargs = {"membership": True, "all": True, "iterator": True}
+        if changed_since is not None:
+            list_kwargs["last_activity_after"] = changed_since.isoformat()
+        projects = list(self._gl.projects.list(**list_kwargs))
+        if changed_since is not None:
+            print(f"[gitlab] --changed-since: {len(projects)} project(s) with activity "
+                  f"at or after {changed_since.isoformat()} (server-side filter)")
         projects.sort(key=lambda p: p.id)
 
         if repo is not None:
@@ -226,11 +267,26 @@ class GitLabTeamReader:
         return list(members_map.values())
 
     def _resolve_email(self, member) -> str | None:
+        """The member's email, falling back to a profile fetch.
+
+        The profile fetch is cached per user id for the life of the run —
+        the same person typically appears on many projects, and without the
+        cache each occurrence costs another call against the same
+        rate-limited endpoint. Misses are cached too (as None), since users
+        with no visible email are common and recur just as often.
+        """
         email = getattr(member, "email", None)
         if email:
-            return email
+            return email  # already on the member record, no fetch needed
+
+        uid = member.id
+        if uid in self._email_cache:
+            return self._email_cache[uid]
         try:
-            user = self._gl.users.get(member.id)
-            return getattr(user, "email", None) or getattr(user, "public_email", None) or None
+            user = self._gl.users.get(uid)
+            email = (getattr(user, "email", None)
+                     or getattr(user, "public_email", None) or None)
         except GitlabError:
-            return None
+            email = None
+        self._email_cache[uid] = email
+        return email

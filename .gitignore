@@ -11,6 +11,8 @@ env
 # --exceptions-file override.
 sync_checkpoint*.json
 *-repos.csv
+*-repos-changed.csv
+apply_cache_*.json
 email_exceptions*.csv
 unmatched_repos*.csv
 repos.json
