@@ -264,6 +264,24 @@ Reading this output:
 - **`would merge scope entries` shows the real PUT payload**, with live product and sub-product ids resolved from the tenant.
 - **Nothing is written in a dry run** — no ArmorCode changes, no checkpoint, no `email_exceptions_<source>.csv` rows. The no-email warnings are only logged to that CSV on an `--apply` run.
 
+### Repos with no matching sub-product
+
+A repo's team scope comes from an ArmorCode sub-product whose name matches the repo name. When there's no match, the team and its users are still provisioned — only the scope is missing. That's easy to lose in a long log, so those repos are also collected and re-listed in the run summary:
+
+```
+======================================================================
+  Done. 7 repo(s) scanned, 2 had armorcode-team topics.
+
+  1 repo(s) had a team topic but NO matching ArmorCode sub-product.
+  Their teams and users were provisioned, but with no product/sub-product
+  scope. Create a sub-product whose name matches the repo name (or correct
+  the topic), then re-run to attach the scope:
+    - acme-org/ac-sdk-v2 (looked for sub-product 'ac-sdk-v2')
+======================================================================
+```
+
+Each entry names the repo and the sub-product name that was searched for, so the fix is either creating that sub-product or correcting the repo's topic. Re-running afterwards attaches the scope — the sync never creates sub-products itself. The block is omitted entirely when everything matched, and `--sparse` shows just the count.
+
 One limitation: dry run reports what it *would* send, not whether that would change anything. `would merge scope entries` prints even when the team is already scoped to those sub-products — on an `--apply` run the same case prints `[noop] scope already covers these sub-products`. To see real change-vs-no-op, run with `--apply`.
 
 ### Apply logging and `--sparse`
@@ -302,5 +320,5 @@ Default (non-sparse) is the right choice for an auditable record; reach for `--s
 - `TENANT_URL` has no default — an unset value is a hard error, never a run against an unintended tenant.
 - The role for new users is validated against the tenant before anything is read or written.
 - Never drops existing team scope or user team memberships — every write is a GET-merge, never a blind overwrite.
-- Sub-products are never created; a repo with no matching sub-product is reported and its team still provisioned, just without that scope.
+- Sub-products are never created; a repo with no matching sub-product is reported inline *and* re-listed in the run summary, with its team still provisioned, just without that scope.
 - Contributors without a resolvable email are logged to `email_exceptions_<source>.csv`, not dropped.

@@ -100,6 +100,11 @@ def sync(reader, state: ArmorCodeState, rows: int | None, dry_run: bool,
 
     repos_seen = 0
     repos_with_teams = 0
+    # Repos that carry a team topic but match no ArmorCode sub-product. Their
+    # team and users are still provisioned; only the scope is missing, which
+    # is easy to miss in a long log — so they're collected and re-listed in
+    # the summary as an actionable "create these sub-products" list.
+    unmatched_repos: list[str] = []
 
     for scm_repo in reader.iter_repos(all_repos, rows=rows, after_id=after_id):
         repos_seen += 1
@@ -130,6 +135,7 @@ def sync(reader, state: ArmorCodeState, rows: int | None, dry_run: bool,
 
         sub_products = state.find_matching_sub_products(repo_name)
         if not sub_products:
+            unmatched_repos.append(f"{full_name} (looked for sub-product {repo_name!r})")
             print(f"    [warn] no ArmorCode sub-product named {repo_name!r} found — "
                   f"team scope cannot be set for this repo (team/users still processed)")
         elif len(sub_products) > 1:
@@ -263,6 +269,18 @@ def sync(reader, state: ArmorCodeState, rows: int | None, dry_run: bool,
 
     print(f"\n{'='*70}")
     print(f"  Done. {repos_seen} repo(s) scanned, {repos_with_teams} had armorcode-team topics.")
+    if unmatched_repos:
+        print(f"\n  {len(unmatched_repos)} repo(s) had a team topic but NO matching "
+              f"ArmorCode sub-product.")
+        print("  Their teams and users were provisioned, but with no product/sub-product")
+        print("  scope. Create a sub-product whose name matches the repo name (or correct")
+        print("  the topic), then re-run to attach the scope:")
+        if sparse:
+            print(f"    ({len(unmatched_repos)} listed above; re-run without --sparse to "
+                  f"see them here)")
+        else:
+            for entry in unmatched_repos:
+                print(f"    - {entry}")
     print(f"{'='*70}\n")
 
     # A full, unfiltered, non-dry-run pass reached the end without being
