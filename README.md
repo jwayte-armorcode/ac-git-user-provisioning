@@ -157,13 +157,25 @@ GITHUB_PAT=github_pat_...
 `TENANT_URL` is required — there is no default tenant, so an unset value is a hard error rather than a run against somewhere unintended.
 
 ```bash
+# Start here: dry run against the first 10 repos only.
+# --rows caps how many repos are processed, so a first look at a real tenant
+# has a small blast radius. It's an upper bound — if the token sees fewer
+# than 10 repos the run just processes what exists and finishes normally.
+python team_sync.py --source github --rows 10
+python team_sync.py --source gitlab --rows 10
+
+# Same, but actually write to ArmorCode — an early "does this really work"
+# check before committing to the whole org
+python team_sync.py --source github --rows 10 --apply
+
+# One-off test against a single repo. Unlike --rows, this pins to one known
+# repo rather than exercising the many-repos path
+python team_sync.py --source github --repo owner/ac-sdk-v2
+python team_sync.py --source gitlab --repo juice-shop
+
 # Dry run against every repo the token can see
 python team_sync.py --source github
 python team_sync.py --source gitlab
-
-# One-off test against a single repo before trusting a full run
-python team_sync.py --source github --repo owner/ac-sdk-v2
-python team_sync.py --source gitlab --repo juice-shop
 
 # Apply for real
 python team_sync.py --source github --repo owner/ac-sdk-v2 --apply
@@ -184,23 +196,7 @@ python team_sync.py --source gitlab --apply --reprocess-from-exceptions
 
 The `tenantRole` for newly-created users comes from `team_sync.ini`. `[armorcode]` applies to both sources; add a `[github]` or `[gitlab]` section to give one SCM a different role. `--default-role` overrides both.
 
-## Testing on a subset of repos
-
-Before trusting a full run on a real tenant, use `--rows N` to cap how many repos get processed — good for an early smoke test across a handful of repos rather than committing to the whole org at once. Unlike `--repo`, which pins to one specific repo, `--rows` takes the first N repos in id order, so it exercises the "many repos" code path (multiple teams, mixed matched/unmatched sub-products) at a small, safe scale.
-
-```bash
-# Dry run against the first 10 repos only
-python team_sync.py --source gitlab --rows 10
-python team_sync.py --source github --rows 10
-
-# Same, but actually write to ArmorCode — an early "does this really work"
-# check on a small blast radius before running against the full tenant
-python team_sync.py --source github --rows 10 --apply
-```
-
-If the token can see fewer than N repos, `--rows` is just an upper bound — the run processes whatever exists and finishes normally.
-
-### What a dry run looks like
+## What a dry run looks like
 
 `python team_sync.py --source github --rows 10` against a tenant where the token can see 7 repos:
 
