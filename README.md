@@ -4,7 +4,7 @@ Provisions ArmorCode Teams, Users, and product/sub-product scope from GitHub and
 
 Repos declare their owning team with a topic; `team_sync.py` reads those topics and creates the matching teams, users, and access scope in ArmorCode.
 
-- **`team_sync.py`** — the sync. One entry point for both SCMs, selected with `--source github|gitlab`.
+- **`team_sync.py`** — the sync. One entry point, selected with `--source github|gitlab|both`.
 - **`set_repo_teams.py`** — bulk-applies the `armorcode-team-*` topics to repos from a CSV, for setting up the input at scale instead of one repo at a time.
 
 Dry run is the default; nothing is written to ArmorCode without `--apply`.
@@ -25,7 +25,9 @@ flowchart TB
 
     subgraph Sync["team_sync.py — team provisioning"]
         R1["scm_readers.py<br/>GitHubTeamReader / GitLabTeamReader"]
-        S2["team_sync.py"]
+        C1["collect: repos dict"]
+        AGG["users dict + teams dict<br/>(aggregated across sources)"]
+        S2["apply: users, then teams"]
         ACM["armorcode.py<br/>client + state + merge helpers"]
     end
 
@@ -47,7 +49,9 @@ flowchart TB
 
     GH --> R1
     GL --> R1
-    R1 --> S2
+    R1 --> C1
+    C1 --> AGG
+    AGG --> S2
     S2 --- ACM
 
     S2 -->|create or find user| U
@@ -63,11 +67,29 @@ flowchart TB
 
 ## Flow
 
+The run has two phases: read every SCM into memory, then provision. Nothing is written to ArmorCode until the whole picture is built.
+
+**Phase 1 — collect (no ArmorCode writes)**
+
 1. Read repo topics for the `armorcode-team-*` (GitHub) or `armorcode-team:*` (GitLab) convention to get one or more team names per repo.
 2. Read members (direct + inherited group members, Reporter+ on GitLab) and split into those with a resolvable email and those without.
-3. For each team name: create the ArmorCode team (scope-only) if missing, or GET the existing team and merge in newly matched product/sub-product scope without dropping anything already scoped.
-4. Create any missing ArmorCode user, then add every member to the team via a GET-merge on the user's `teamInfo` (team membership lives on the user record, not the team).
-5. Members with no resolvable email are appended to `email_exceptions_<source>.csv` instead of being silently dropped. Once an admin fills in the email column by hand, `--reprocess-from-exceptions` provisions them and marks the row `reprocessed`.
+3. Match each repo name to ArmorCode sub-products.
+4. Invert that into two maps: **users** keyed by email, and **teams** keyed by name — each team holding the union of its members and sub-products across every repo that names it, from both SCMs.
+
+**Phase 2 — apply (one pass per user, one pass per team)**
+
+5. Create any missing ArmorCode user, once per distinct email.
+6. For each team: create it (scope-only) if missing, or GET the existing team and merge in its full scope without dropping anything already scoped. Then add every member via a GET-merge on the user's `teamInfo` (team membership lives on the user record, not the team).
+7. Members with no resolvable email are appended to `email_exceptions_<source>.csv` instead of being silently dropped. Once an admin fills in the email column by hand, `--reprocess-from-exceptions` provisions them and marks the row `reprocessed`.
+
+Aggregating before provisioning is what keeps the run cheap. A team owning 25 repos is created, scoped and populated **once** — not 25 times — and a user on 50 repos is evaluated once. Because dict work is free and every API call is paced at 0.6s, this is the difference between hours and minutes on a large tenant:
+
+| Tenant | Per-repo (before) | Aggregated | |
+|---|---|---|---|
+| 5,000 repos / 200 teams | ~30,000 calls | ~5,900 | 80% fewer |
+| 50,000 repos / 800 teams | ~350,000 calls | ~56,600 | 84% fewer |
+
+It also makes the scope write more correct: a team's complete sub-product set is computed in memory and written in a single merge, instead of growing through 25 sequential read-merge-write round trips.
 
 Checkpointing is automatic — no flag required. Every `--apply` run writes the last-completed repo id (sorted ascending, a stable order across runs) to `sync_checkpoint_<source>.json` after each repo, and checks for it at startup: if one exists, the run resumes right after it instead of starting over. A killed run on a very large tenant can simply be restarted with the exact same command. The checkpoint clears automatically once a full, unfiltered `--apply` run completes. The default path is per-source, so a GitHub run and a GitLab run never clobber each other's progress. `email_exceptions_<source>.csv` is per-source for the same reason: it's rewritten whole on every update, so two concurrent runs sharing one path would silently drop each other's rows. Running both sources at once in separate windows is safe on the defaults — override `--checkpoint-file` / `--exceptions-file` to a shared path only if the runs don't overlap.
 
@@ -75,7 +97,7 @@ Checkpointing is automatic — no flag required. Every `--apply` run writes the 
 
 | File | Role |
 |---|---|
-| `team_sync.py` | Entry point, CLI, per-repo sync loop |
+| `team_sync.py` | Entry point, CLI, collect + apply phases |
 | `scm_readers.py` | `GitHubTeamReader` / `GitLabTeamReader` behind one interface |
 | `armorcode.py` | ArmorCode REST client, cached tenant state, scope/membership merge helpers |
 | `email_exceptions.py` | Read/write the no-email exception CSV |
@@ -164,6 +186,11 @@ GITHUB_PAT=github_pat_...
 python team_sync.py --source github --rows 10
 python team_sync.py --source gitlab --rows 10
 
+# Both SCMs in one run. Preferred when you use both: a team owning repos in
+# GitHub AND GitLab becomes one team with the union of its scope and members,
+# whereas two separate runs would each write only their own half.
+python team_sync.py --source both --rows 10
+
 # Same, but actually write to ArmorCode — an early "does this really work"
 # check before committing to the whole org
 python team_sync.py --source github --rows 10 --apply
@@ -185,7 +212,22 @@ python team_sync.py --source gitlab --apply --default-role "Security Engineer"
 
 # After an admin fills in an email in email_exceptions_<source>.csv, provision that person
 python team_sync.py --source gitlab --apply --reprocess-from-exceptions
+
+# Dump the in-memory picture for review before provisioning anything
+python team_sync.py --source both --dump-json
 ```
+
+### `--source both`
+
+`both` reads GitHub and GitLab in the collect phase, then provisions from the combined picture. Teams are keyed on **name alone**, so `armorcode-team-payments` on a GitHub repo and `armorcode-team:Payments` on a GitLab project resolve to the same ArmorCode team, which ends up scoped to the sub-products of both. Users are deduplicated on lowercased email across sources.
+
+Each SCM keeps its own checkpoint (`sync_checkpoint_github.json`, `sync_checkpoint_gitlab.json`) because they're read separately and a single file couldn't express "GitHub done, GitLab halfway" — so `--checkpoint-file` is rejected with `--source both`. The exceptions CSV defaults to `email_exceptions_both.csv`.
+
+Since `both` provisions one shared user pool, only `[armorcode] default_role` applies; per-source `[github]`/`[gitlab]` sections are ignored, with a warning if they're set.
+
+### `--dump-json`
+
+Writes the collect phase's output for inspection: `repos.json` (per repo: teams, members, matched sub-products), `users.json` (distinct users and which SCMs they came from), `teams.json` (per team: members, sub-product ids, contributing repos). Off by default — on a large tenant `repos.json` is big, and the same information is in the log. Useful for reviewing a run before applying, or for diffing two runs.
 
 ### Role for new users
 

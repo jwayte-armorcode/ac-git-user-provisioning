@@ -12,6 +12,9 @@ env
 sync_checkpoint*.json
 email_exceptions*.csv
 unmatched_repos*.csv
+repos.json
+users.json
+teams.json
 
 # Python
 __pycache__/
