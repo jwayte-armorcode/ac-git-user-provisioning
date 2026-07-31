@@ -941,8 +941,17 @@ def main():
             "  python github_team_sync.py --env env_github --ac-env ../myproject/env --apply\n"
         ),
     )
-    parser.add_argument("--env", default="env_github", help="Path to GitHub token env file (default: env_github)")
-    parser.add_argument("--ac-env", required=True, help="Path to ArmorCode tenant env file (token/url)")
+    parser.add_argument("--env", default="env_github",
+                        help="Path to the env file (default: env_github). Holds the GitHub token "
+                             "(GITHUB_PAT, or legacy token) and, unless --ac-env is given "
+                             "separately, the ArmorCode tenant token too (API_TOKEN / "
+                             "TENANT_URL) — a single file with both sets of keys works fine "
+                             "since they don't collide.")
+    parser.add_argument("--ac-env", default=None,
+                        help="Path to the ArmorCode tenant env file (API_TOKEN / TENANT_URL, or "
+                             "legacy token/url). Defaults to the same file as --env — pass this "
+                             "only if you keep the GitHub and ArmorCode credentials in separate "
+                             "files.")
     parser.add_argument("--rows", type=int, default=None,
                         help="Limit to the first N GitHub repos (for testing)")
     parser.add_argument("--repo", default=None,
@@ -993,18 +1002,26 @@ def main():
     args = parser.parse_args()
     dry_run = not args.apply  # default True unless --apply passed
 
+    # --ac-env defaults to the same file as --env: the qualified key names
+    # (GITHUB_PAT vs API_TOKEN/TENANT_URL) don't collide, so one combined
+    # file works fine. Only the legacy bare "token"/"url" fallback keys are
+    # ambiguous across services — checked last, after every qualified key,
+    # precisely so a combined file's "token=" (meant for one service) can't
+    # be misread as the other service's credential.
+    ac_env_path = args.ac_env or args.env
+
     gh_env = load_env_file(args.env)
-    gh_pat = gh_env.get("token") or gh_env.get("GITHUB_PAT")
+    gh_pat = gh_env.get("GITHUB_PAT") or gh_env.get("token")
     if not gh_pat:
-        print(f"[error] no GitHub token found in {args.env} (expected 'token' or 'GITHUB_PAT')")
+        print(f"[error] no GitHub token found in {args.env} (expected 'GITHUB_PAT' or 'token')")
         sys.exit(1)
 
-    ac_env = load_env_file(args.ac_env)
-    ac_token = ac_env.get("token") or ac_env.get("API_TOKEN")
-    ac_url = (ac_env.get("url") or ac_env.get("TENANT_URL") or "https://app.armorcode.com")
+    ac_env = load_env_file(ac_env_path)
+    ac_token = ac_env.get("API_TOKEN") or ac_env.get("token")
+    ac_url = (ac_env.get("TENANT_URL") or ac_env.get("url") or "https://app.armorcode.com")
     ac_url = ac_url.replace("https://", "").replace("http://", "")
     if not ac_token:
-        print(f"[error] no ArmorCode token found in {args.ac_env}")
+        print(f"[error] no ArmorCode token found in {ac_env_path}")
         sys.exit(1)
 
     default_role = load_default_role(args.config, args.default_role)

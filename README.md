@@ -159,7 +159,7 @@ python set_repo_teams.py --csv teams.csv --gitlab-env env_gitlab --github-env en
 
 ## Usage
 
-All commands assume an ArmorCode tenant env file (`token=`/`url=`, or `API_TOKEN`/`TENANT_URL`) and an SCM token env file (`env_github` / `env_gitlab`, or the `--env` default names shown below).
+Each script reads a single `--env` file by default — one file holding both the SCM token and the ArmorCode tenant token, since the key names don't collide (`GITLAB_PAT`/`GITLAB_URL` or `GITHUB_PAT` for the SCM side, `API_TOKEN`/`TENANT_URL` for ArmorCode; see `env.example`). Pass `--ac-env` separately only if you keep the two sets of credentials in different files.
 
 ### `sync.py`
 
@@ -183,30 +183,33 @@ python sync.py --source gitlab --apply --create-missing-subproducts
 ### `gitlab_team_sync.py` / `github_team_sync.py`
 
 ```bash
-# Dry run against every repo the token can see
-python gitlab_team_sync.py --env env_gitlab --ac-env /path/to/tenant/env
-python github_team_sync.py --env env_github --ac-env /path/to/tenant/env
+# Dry run against every repo the token can see — one env file, both credential sets
+python gitlab_team_sync.py --env env_gitlab
+python github_team_sync.py --env env_github
 
 # One-off test against a single repo before trusting a full run
-python gitlab_team_sync.py --env env_gitlab --ac-env ../tenant/env --repo juice-shop
-python github_team_sync.py --env env_github --ac-env ../tenant/env --repo owner/ac-sdk-v2
+python gitlab_team_sync.py --env env_gitlab --repo juice-shop
+python github_team_sync.py --env env_github --repo owner/ac-sdk-v2
 
 # Apply for real
-python gitlab_team_sync.py --env env_gitlab --ac-env ../tenant/env --repo juice-shop --apply
-python github_team_sync.py --env env_github --ac-env ../tenant/env --repo owner/ac-sdk-v2 --apply
+python gitlab_team_sync.py --env env_gitlab --repo juice-shop --apply
+python github_team_sync.py --env env_github --repo owner/ac-sdk-v2 --apply
 
 # Full run on a very large tenant — checkpointing is automatic, no flag needed
-python github_team_sync.py --env env_github --ac-env ../tenant/env --apply
+python github_team_sync.py --env env_github --apply
 
 # If it's killed partway through, run the EXACT same command again —
 # it reads sync_checkpoint.json and picks up right after the last completed repo id
-python github_team_sync.py --env env_github --ac-env ../tenant/env --apply
+python github_team_sync.py --env env_github --apply
 
 # Override the default role assigned to newly-created ArmorCode users
-python gitlab_team_sync.py --env env_gitlab --ac-env ../tenant/env --apply --default-role "Security Engineer"
+python gitlab_team_sync.py --env env_gitlab --apply --default-role "Security Engineer"
 
 # After an admin fills in an email in email_exceptions.csv, provision that person
-python gitlab_team_sync.py --env env_gitlab --ac-env ../tenant/env --apply --reprocess-from-exceptions
+python gitlab_team_sync.py --env env_gitlab --apply --reprocess-from-exceptions
+
+# If GitLab/GitHub and ArmorCode credentials live in separate files
+python gitlab_team_sync.py --env env_gitlab --ac-env /path/to/armorcode/env --apply
 ```
 
 ## Testing on a subset of repos
@@ -215,13 +218,13 @@ Before trusting a full run on a real tenant, use `--rows N` to cap how many repo
 
 ```bash
 # Dry run against the first 10 repos only, for each source
-python gitlab_team_sync.py --env env_gitlab --ac-env ../tenant/env --rows 10
-python github_team_sync.py --env env_github --ac-env ../tenant/env --rows 10
+python gitlab_team_sync.py --env env_gitlab --rows 10
+python github_team_sync.py --env env_github --rows 10
 
 # Same, but actually write to ArmorCode — good for an early "does this really work" check
 # on a small blast radius before running against the full tenant
-python gitlab_team_sync.py --env env_gitlab --ac-env ../tenant/env --rows 10 --apply
-python github_team_sync.py --env env_github --ac-env ../tenant/env --rows 10 --apply
+python gitlab_team_sync.py --env env_gitlab --rows 10 --apply
+python github_team_sync.py --env env_github --rows 10 --apply
 
 # --rows and --repo can't usefully combine (--repo already limits to one repo);
 # use --rows for a broad small-scale smoke test, --repo for a single known repo

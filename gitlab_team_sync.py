@@ -900,8 +900,17 @@ def main():
             "  python gitlab_team_sync.py --env env_gitlab --ac-env ../myproject/env --apply\n"
         ),
     )
-    parser.add_argument("--env", default="env_gitlab", help="Path to GitLab token env file (default: env_gitlab)")
-    parser.add_argument("--ac-env", required=True, help="Path to ArmorCode tenant env file (token/url)")
+    parser.add_argument("--env", default="env_gitlab",
+                        help="Path to the env file (default: env_gitlab). Holds the GitLab token "
+                             "(GITLAB_PAT / GITLAB_URL, or legacy token2/token) and, unless "
+                             "--ac-env is given separately, the ArmorCode tenant token too "
+                             "(API_TOKEN / TENANT_URL) — a single file with both sets of keys "
+                             "works fine since they don't collide.")
+    parser.add_argument("--ac-env", default=None,
+                        help="Path to the ArmorCode tenant env file (API_TOKEN / TENANT_URL, or "
+                             "legacy token/url). Defaults to the same file as --env — pass this "
+                             "only if you keep the GitLab and ArmorCode credentials in separate "
+                             "files.")
     parser.add_argument("--rows", type=int, default=None,
                         help="Limit to the first N GitLab projects (for testing)")
     parser.add_argument("--repo", default=None,
@@ -952,19 +961,27 @@ def main():
     args = parser.parse_args()
     dry_run = not args.apply  # default True unless --apply passed
 
+    # --ac-env defaults to the same file as --env: the qualified key names
+    # (GITLAB_PAT/GITLAB_URL vs API_TOKEN/TENANT_URL) don't collide, so one
+    # combined file works fine. Only the legacy bare "token"/"url" fallback
+    # keys are ambiguous across services — checked last, after every
+    # qualified key, precisely so a combined file's "url=" (meant for one
+    # service) can't be misread as the other service's URL.
+    ac_env_path = args.ac_env or args.env
+
     gl_env = load_env_file(args.env)
-    gl_pat = gl_env.get("token2") or gl_env.get("GITLAB_PAT") or gl_env.get("token")
+    gl_pat = gl_env.get("GITLAB_PAT") or gl_env.get("token2") or gl_env.get("token")
     if not gl_pat:
-        print(f"[error] no GitLab token found in {args.env} (expected 'token2', 'token', or 'GITLAB_PAT')")
+        print(f"[error] no GitLab token found in {args.env} (expected 'GITLAB_PAT', 'token2', or 'token')")
         sys.exit(1)
     gl_url = gl_env.get("GITLAB_URL") or gl_env.get("url") or "https://gitlab.com"
 
-    ac_env = load_env_file(args.ac_env)
-    ac_token = ac_env.get("token") or ac_env.get("API_TOKEN")
-    ac_url = (ac_env.get("url") or ac_env.get("TENANT_URL") or "https://app.armorcode.com")
+    ac_env = load_env_file(ac_env_path)
+    ac_token = ac_env.get("API_TOKEN") or ac_env.get("token")
+    ac_url = (ac_env.get("TENANT_URL") or ac_env.get("url") or "https://app.armorcode.com")
     ac_url = ac_url.replace("https://", "").replace("http://", "")
     if not ac_token:
-        print(f"[error] no ArmorCode token found in {args.ac_env}")
+        print(f"[error] no ArmorCode token found in {ac_env_path}")
         sys.exit(1)
 
     default_role = load_default_role(args.config, args.default_role)
