@@ -263,11 +263,13 @@ python team_sync.py --source both --apply
 python team_sync.py --source both --apply
 
 # Repeat run: teams unchanged since the last run are skipped (see the apply
-# cache below). Fast, but blind to edits made in the ArmorCode UI.
+# cache below). Fast, but blind to edits made in the ArmorCode UI (i.e. if a
+# user was removed from a team in ArmorCode this run won't add them back).
 python team_sync.py --source both --apply
 
-# Periodic reconcile — ignores the cache and re-checks every team.
-# Run this regularly (weekly, say) so hand edits get repaired.
+# Periodic reconcile — ignores the cache and re-checks every team, so the
+# removed user above IS added back. Run this regularly (weekly, say): it is
+# the only thing that repairs drift introduced in the ArmorCode UI.
 python team_sync.py --source both --apply --full
 
 # Fast interim pass over only repos touched since a date. Opt-in, and NOT a
