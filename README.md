@@ -264,6 +264,35 @@ Reading this output:
 - **`would merge scope entries` shows the real PUT payload**, with live product and sub-product ids resolved from the tenant.
 - **Nothing is written in a dry run** — no ArmorCode changes, no checkpoint, no `email_exceptions_<source>.csv` rows. The no-email warnings are only logged to that CSV on an `--apply` run.
 
+### Progress and rate limits
+
+Every 25 repos the run prints a heartbeat, so a large tenant shows movement instead of looking hung — repos with no team topic produce no other output:
+
+```
+[progress] 2500/98431 repos (3%), 214 with team topics, 1.8 repo/s, ~14h50m remaining
+```
+
+The denominator is what *this* run will process, so it accounts for `--rows` and for repos already skipped on a checkpoint resume. The rate and ETA are running averages from the start of the run.
+
+ArmorCode enforces these limits:
+
+| Access type | Limit |
+|---|---|
+| Per API token | 2,000 RPM |
+| Per endpoint (token-based) | 100 RPM |
+| User session — write | 100 RPM |
+| User session — read | 200 RPM |
+
+The per-endpoint limit is the binding one here: a long run calls the same few endpoints repeatedly (one `get_sub_product` per matched sub-product, one user update per member), so it can exceed 100 RPM on a single endpoint while nowhere near the 2,000 RPM token budget. Requests are therefore paced **per endpoint** at 100 RPM (one every 0.6s), bucketed by URL path with numeric ids collapsed — `/api/sub-product/1` and `/api/sub-product/2` share one budget, matching how the server counts them. Unrelated endpoints don't slow each other down.
+
+If a 429 happens anyway, the run **waits it out and carries on** rather than aborting:
+
+```
+[rate-limit] GET api/sub-product/{id} -> 429, waiting 30s for the limit to reset (waited 30s total, attempt 1); the run continues automatically
+```
+
+Rate limits are transient by definition, so 429s retry until they clear, honouring `Retry-After` when the server sends it and backing off exponentially otherwise. The only bound is a one-hour safety net for a limit that never resets. Server errors (5xx) keep a **bounded** retry count instead, since a 500 can be permanent — ArmorCode returns one for "User Can Not Update Him/Her Self", for instance, and retrying that forever would be indistinguishable from a hang.
+
 ### Repos with no matching sub-product
 
 A repo's team scope comes from an ArmorCode sub-product whose name matches the repo name. When there's no match, the team and its users are still provisioned — only the scope is missing. That's easy to lose in a long log, so those repos are also collected and re-listed in the run summary:
@@ -340,3 +369,4 @@ Default (non-sparse) is the right choice for an auditable record; reach for `--s
 - Never drops existing team scope or user team memberships — every write is a GET-merge, never a blind overwrite.
 - Sub-products are never created; a repo with no matching sub-product is reported inline *and* re-listed in the run summary, with its team still provisioned, just without that scope.
 - Contributors without a resolvable email are logged to `email_exceptions_<source>.csv`, not dropped.
+- Requests are paced under ArmorCode's per-endpoint rate limit, and a 429 is waited out rather than aborting the run.

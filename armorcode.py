@@ -16,63 +16,130 @@ import configparser
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import requests
 
 
-class _ThrottledRetrySession(requests.Session):
-    """A ``requests.Session`` that paces requests and retries on throttling.
+# ArmorCode's published rate limits (as of 2026-07):
+#
+#   Per API token          2,000 RPM
+#   Per endpoint (token)     100 RPM   <-- the binding constraint here
+#   User session, write      100 RPM
+#   User session, read       200 RPM
+#
+# The per-endpoint limit is what this tool actually hits: a long run calls
+# the same few endpoints over and over (get_sub_product once per matched
+# sub-product, update_user_team_info once per user), so it can exceed 100
+# RPM on a single endpoint while nowhere near the 2,000 RPM token budget.
+#
+# 100 RPM = one request every 0.6s. The default pacing below is per-endpoint
+# rather than global, so unrelated endpoints don't slow each other down.
+PER_ENDPOINT_RPM = 100
+MIN_ENDPOINT_INTERVAL = 60.0 / PER_ENDPOINT_RPM  # 0.6s
 
-    Ported verbatim from ac-sdk-v2's armorcode/client.py. Retries 429/5xx
-    with exponential backoff (honoring Retry-After); other statuses (incl.
-    4xx) are returned immediately for raise_for_status() to handle.
+
+class _ThrottledRetrySession(requests.Session):
+    """A ``requests.Session`` that paces requests per endpoint and waits out
+    rate limits.
+
+    Based on ac-sdk-v2's armorcode/client.py, with rate-limit handling
+    reworked for long runs:
+
+    - Pacing is PER ENDPOINT (path), not global, because ArmorCode's tight
+      limit is per-endpoint. A global interval would either be too slow
+      (pacing every call at the per-endpoint rate) or too permissive
+      (hammering one endpoint while the token budget looks fine).
+    - A 429 is transient by definition — the limit resets. So 429s retry
+      effectively indefinitely (bounded by max_429_wait as a safety net)
+      rather than giving up after N attempts and killing the run.
+    - 5xx keeps a bounded retry count, since a 500 can be permanent (e.g.
+      "User Can Not Update Him/Her Self") and must not spin forever.
     """
 
-    def __init__(self, *args, min_interval=0.0, max_retries=8,
-                 backoff_base=2.0, backoff_cap=60.0, **kwargs):
+    def __init__(self, *args, min_interval=MIN_ENDPOINT_INTERVAL, max_retries=8,
+                 backoff_base=2.0, backoff_cap=60.0, max_429_wait=3600.0, **kwargs):
         super().__init__(*args, **kwargs)
         self._min_interval = min_interval
         self._max_retries = max_retries
         self._backoff_base = backoff_base
         self._backoff_cap = backoff_cap
-        self._last_request_ts = 0.0
+        self._max_429_wait = max_429_wait
+        # Per-endpoint last-request timestamps, keyed by URL path.
+        self._last_request_ts: dict[str, float] = {}
 
-    def _sleep_to_throttle(self):
+    @staticmethod
+    def _endpoint_key(url: str) -> str:
+        """Bucket requests by URL path, ignoring the query string, so
+        /api/sub-product/1 and /api/sub-product/2 share one bucket — the
+        server's per-endpoint limit treats them as the same endpoint."""
+        path = urlsplit(url).path
+        # Collapse trailing numeric id segments so /api/team/123 and
+        # /api/team/456 land in the same bucket.
+        parts = [p for p in path.split("/") if p]
+        return "/".join("{id}" if p.isdigit() else p for p in parts)
+
+    def _sleep_to_throttle(self, key: str):
         if self._min_interval <= 0:
             return
-        elapsed = time.monotonic() - self._last_request_ts
-        wait = self._min_interval - elapsed
+        last = self._last_request_ts.get(key)
+        if last is None:
+            return
+        wait = self._min_interval - (time.monotonic() - last)
         if wait > 0:
             time.sleep(wait)
 
     def request(self, method, url, **kwargs):
+        key = self._endpoint_key(url)
         delay = self._backoff_base
-        last_resp = None
-        for attempt in range(self._max_retries + 1):
-            self._sleep_to_throttle()
-            self._last_request_ts = time.monotonic()
+        server_errors = 0
+        waited_on_429 = 0.0
+        attempt = 0
+
+        while True:
+            attempt += 1
+            self._sleep_to_throttle(key)
+            self._last_request_ts[key] = time.monotonic()
             resp = super().request(method, url, **kwargs)
+
             if resp.status_code != 429 and resp.status_code < 500:
                 return resp
-            last_resp = resp
-            if attempt >= self._max_retries:
-                break
+
             retry_after = resp.headers.get("Retry-After")
-            if retry_after and str(retry_after).isdigit():
-                wait = float(retry_after)
+            if retry_after and str(retry_after).strip().isdigit():
+                wait = float(str(retry_after).strip())
             else:
-                wait = delay
+                wait = min(delay, self._backoff_cap)
                 delay = min(delay * 2, self._backoff_cap)
-            wait = min(wait, self._backoff_cap)
+
+            if resp.status_code == 429:
+                # Rate limited: keep waiting. The limit resets, so giving up
+                # here would abort a run for a purely temporary condition.
+                # max_429_wait only guards against a limit that never clears.
+                if waited_on_429 + wait > self._max_429_wait:
+                    print(f"    [rate-limit] {method} {key} still 429 after "
+                          f"{waited_on_429:.0f}s of waiting (limit "
+                          f"{self._max_429_wait:.0f}s) — giving up")
+                    return resp
+                waited_on_429 += wait
+                print(f"    [rate-limit] {method} {key} -> 429, waiting {wait:.0f}s "
+                      f"for the limit to reset (waited {waited_on_429:.0f}s total, "
+                      f"attempt {attempt}); the run continues automatically")
+                time.sleep(wait)
+                continue
+
+            # 5xx: bounded, because it may be permanent.
+            server_errors += 1
+            if server_errors > self._max_retries:
+                return resp
             # A blind retry-on-5xx can silently sit for minutes on a
             # PERMANENT error (e.g. a 500 the server will never stop
             # returning, like "User Can Not Update Him/Her Self") — that
             # looks indistinguishable from a real hang unless it's logged.
             print(f"    [retry] {method} {url} -> {resp.status_code} "
-                  f"(attempt {attempt + 1}/{self._max_retries + 1}, "
+                  f"(server error {server_errors}/{self._max_retries}, "
                   f"waiting {wait:.0f}s): {resp.text[:200]}")
             time.sleep(wait)
-        return last_resp
 
 
 class ArmorCodeClient:
@@ -84,7 +151,7 @@ class ArmorCodeClient:
     """
 
     def __init__(self, tenant_url, token, *, timeout=60,
-                 min_request_interval=0.0, max_retries=8):
+                 min_request_interval=MIN_ENDPOINT_INTERVAL, max_retries=8):
         self.base_url = f"https://{tenant_url.rstrip('/')}"
         self._session = _ThrottledRetrySession(
             min_interval=min_request_interval,

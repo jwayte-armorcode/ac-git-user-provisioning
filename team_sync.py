@@ -40,6 +40,7 @@ from __future__ import annotations
 import argparse
 import csv
 import sys
+import time
 from datetime import date, datetime
 
 import email_exceptions
@@ -73,7 +74,24 @@ def build_reader(source: str, env: dict):
     return GitLabTeamReader(pat, url)
 
 
+# How often to print the progress heartbeat, in repos. Small enough that a
+# large tenant shows movement, large enough not to drown the per-repo output
+# on a small one.
+PROGRESS_EVERY = 25
+
 UNMATCHED_CSV_COLUMNS = ["source", "repo", "expected_sub_product", "teams"]
+
+
+def _fmt_duration(seconds: float) -> str:
+    """Human-readable duration for ETAs: 45s, 12m, 3h20m."""
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    hours, rem = divmod(seconds, 3600)
+    minutes = rem // 60
+    return f"{hours}h{minutes:02d}m" if minutes else f"{hours}h"
 
 
 def write_unmatched_csv(path: str, rows: list[dict]) -> None:
@@ -126,11 +144,37 @@ def sync(reader, state: ArmorCodeState, rows: int | None, dry_run: bool,
     # optionally written to CSV via --unmatched-csv.
     unmatched_repos: list[dict] = []
 
+    # Denominator for progress. A resumed or --rows run processes fewer repos
+    # than the tenant holds, so count what THIS run will actually touch.
+    skipped_by_resume = sum(
+        1 for r in all_repos if after_id is not None and reader.repo_id(r) <= after_id
+    )
+    to_process = total_count - skipped_by_resume
+    if rows is not None:
+        to_process = min(to_process, rows)
+    started_at = time.monotonic()
+
     for scm_repo in reader.iter_repos(all_repos, rows=rows, after_id=after_id):
         repos_seen += 1
         repo_id = reader.repo_id(scm_repo)
         full_name = reader.repo_full_name(scm_repo)
         repo_name = reader.repo_name(scm_repo)  # short name, matched to AC sub-products
+
+        # Heartbeat. Repos without a team topic produce no other output, so
+        # without this a large tenant looks hung for long stretches. Printed
+        # every PROGRESS_EVERY repos, and on the last one so the tail is
+        # never silent.
+        if repos_seen % PROGRESS_EVERY == 0 or repos_seen == to_process:
+            elapsed = time.monotonic() - started_at
+            rate = repos_seen / elapsed if elapsed > 0 else 0
+            pct = (repos_seen / to_process * 100) if to_process else 100.0
+            msg = (f"[progress] {repos_seen}/{to_process} repos ({pct:.0f}%), "
+                   f"{repos_with_teams} with team topics, {rate:.1f} repo/s")
+            if rate > 0 and repos_seen < to_process:
+                eta = (to_process - repos_seen) / rate
+                msg += f", ~{_fmt_duration(eta)} remaining"
+            print(msg)
+
         team_names = reader.get_team_names(scm_repo)
 
         def checkpoint():
