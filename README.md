@@ -81,6 +81,60 @@ Both scripts support `--resume`, checkpointing the last-completed repo/project i
 
 Both scripts read `default_role` for newly-created users from their own `.ini` file (`github_team_sync.ini` / `gitlab_team_sync.ini`), overridable with `--default-role`.
 
+## Usage
+
+All commands assume an ArmorCode tenant env file (`token=`/`url=`, or `API_TOKEN`/`TENANT_URL`) and an SCM token env file (`env_github` / `env_gitlab`, or the `--env` default names shown below).
+
+### `sync.py`
+
+```bash
+# Dry run (default) — see what would happen, nothing written
+python sync.py --source github
+
+# Apply for real — invite missing users, tag existing matching sub-products
+python sync.py --source github --apply
+
+# Both sources in one pass, explicit dry run
+python sync.py --source all --dry-run
+
+# Use a non-default env file
+python sync.py --source gitlab --env ~/my-env --apply
+
+# Opt in to creating sub-products for repos with no existing match
+python sync.py --source gitlab --apply --create-missing-subproducts
+```
+
+### `gitlab_team_sync.py` / `github_team_sync.py`
+
+```bash
+# Dry run against every repo the token can see
+python gitlab_team_sync.py --env env_gitlab --ac-env /path/to/tenant/env
+python github_team_sync.py --env env_github --ac-env /path/to/tenant/env
+
+# One-off test against a single repo before trusting a full run
+python gitlab_team_sync.py --env env_gitlab --ac-env ../tenant/env --repo juice-shop
+python github_team_sync.py --env env_github --ac-env ../tenant/env --repo owner/ac-sdk-v2
+
+# Apply for real
+python gitlab_team_sync.py --env env_gitlab --ac-env ../tenant/env --repo juice-shop --apply
+python github_team_sync.py --env env_github --ac-env ../tenant/env --repo owner/ac-sdk-v2 --apply
+
+# Cap how many repos are processed, e.g. for a quick smoke test
+python gitlab_team_sync.py --env env_gitlab --ac-env ../tenant/env --rows 5
+
+# Full run on a very large tenant, resumable if killed partway through
+python github_team_sync.py --env env_github --ac-env ../tenant/env --apply --resume
+
+# Re-run after a kill — picks up after the last completed repo id automatically
+python github_team_sync.py --env env_github --ac-env ../tenant/env --apply --resume
+
+# Override the default role assigned to newly-created ArmorCode users
+python gitlab_team_sync.py --env env_gitlab --ac-env ../tenant/env --apply --default-role "Security Engineer"
+
+# After an admin fills in an email in email_exceptions.csv, provision that person
+python gitlab_team_sync.py --env env_gitlab --ac-env ../tenant/env --apply --reprocess-from-exceptions
+```
+
 ## Safety defaults
 
 - Dry run by default; `--apply` is required to write anything.
