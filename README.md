@@ -236,6 +236,12 @@ python team_sync.py --source both --rows 10
 python team_sync.py --source github --rows 10
 python team_sync.py --source gitlab --rows 10
 
+# Still nothing written: dump what the run collected to repos.json, users.json
+# and teams.json. The clearest way to see how the pieces fit — which repos map
+# to which teams, which members resolved to an email, and the sub-products each
+# team would be scoped to — before letting it write anything.
+python team_sync.py --source both --rows 10 --dump-json
+
 # Same, but actually write to ArmorCode — an early "does this really work"
 # check before committing to the whole org
 python team_sync.py --source both --rows 10 --apply
@@ -280,9 +286,6 @@ python team_sync.py --source both --apply --default-role "Security Engineer"
 # row reprocessed. Reads the CSV for the source(s) you name, so match the flag
 # to the run that produced it (--source both -> email_exceptions_both.csv)
 python team_sync.py --source both --apply --reprocess-from-exceptions
-
-# Dump the in-memory picture for review before provisioning anything
-python team_sync.py --source both --dump-json
 ```
 
 If you use both GitHub and GitLab, prefer `--source both` for real runs — see below for why it matters. Use a single source when you only have one, or when staging a rollout one SCM at a time.
