@@ -80,7 +80,7 @@ The run has two phases: read every SCM into memory, then provision. Nothing is w
 
 5. Create any missing ArmorCode user, once per distinct email.
 6. For each team: create it (scope-only) if missing, or GET the existing team and merge in its full scope without dropping anything already scoped. Then add every member via a GET-merge on the user's `teamInfo` (team membership lives on the user record, not the team).
-7. Members with no resolvable email are appended to `email_exceptions_<source>.csv` instead of being silently dropped. Once an admin fills in the email column by hand, `--reprocess-from-exceptions` provisions them and marks the row `reprocessed`.
+7. Members whose email the token cannot see are appended to `email_exceptions_<source>.csv` instead of being silently dropped — ArmorCode users are keyed by email, so there is no way to provision them without one. This is common rather than exceptional: GitHub emails are private unless the user publishes one, and GitLab only exposes an email to a sufficiently privileged token. Once an admin fills in the email column by hand, `--reprocess-from-exceptions` provisions them and marks the row `reprocessed`.
 
 Aggregating before provisioning is what keeps the run cheap. A team owning 25 repos is created, scoped and populated **once** — not 25 times — and a user on 50 repos is evaluated once. Because dict work is free and every API call is paced at 0.6s, this is the difference between hours and minutes on a large tenant:
 
@@ -271,9 +271,14 @@ python team_sync.py --source both --apply --changed-since 2026-07-01
 # Override the default role assigned to newly-created ArmorCode users
 python team_sync.py --source both --apply --default-role "Security Engineer"
 
-# After an admin fills in an email in email_exceptions_<source>.csv, provision
-# that person. Reads the CSV for the source(s) you name, so match the flag to
-# the run that produced it (--source both -> email_exceptions_both.csv)
+# ArmorCode users are keyed by email, so a member whose email the token cannot
+# see cannot be provisioned. That is common: GitHub emails are private unless
+# the user publishes one, and GitLab only exposes an email to a sufficiently
+# privileged token. Those members are never silently dropped — they are written
+# to email_exceptions_<source>.csv with a blank email column, for an admin to
+# fill in by hand. This run then provisions whoever now has one and marks the
+# row reprocessed. Reads the CSV for the source(s) you name, so match the flag
+# to the run that produced it (--source both -> email_exceptions_both.csv)
 python team_sync.py --source both --apply --reprocess-from-exceptions
 
 # Dump the in-memory picture for review before provisioning anything
