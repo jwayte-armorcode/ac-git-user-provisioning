@@ -195,9 +195,6 @@ python github_team_sync.py --env env_github --ac-env ../tenant/env --repo owner/
 python gitlab_team_sync.py --env env_gitlab --ac-env ../tenant/env --repo juice-shop --apply
 python github_team_sync.py --env env_github --ac-env ../tenant/env --repo owner/ac-sdk-v2 --apply
 
-# Cap how many repos are processed, e.g. for a quick smoke test
-python gitlab_team_sync.py --env env_gitlab --ac-env ../tenant/env --rows 5
-
 # Full run on a very large tenant, resumable if killed partway through
 python github_team_sync.py --env env_github --ac-env ../tenant/env --apply --resume
 
@@ -210,6 +207,26 @@ python gitlab_team_sync.py --env env_gitlab --ac-env ../tenant/env --apply --def
 # After an admin fills in an email in email_exceptions.csv, provision that person
 python gitlab_team_sync.py --env env_gitlab --ac-env ../tenant/env --apply --reprocess-from-exceptions
 ```
+
+## Testing on a subset of repos
+
+Before trusting a full run on a real tenant, use `--rows N` to cap how many repos/projects get processed — good for an early smoke test across a handful of repos rather than committing to the whole org at once. Unlike `--repo`, which pins to one specific repo, `--rows` takes the first N repos in whatever order the SCM API/sort returns them, so it exercises the "many repos" code path (multiple teams, mixed matched/unmatched sub-products, etc.) at a small, safe scale.
+
+```bash
+# Dry run against the first 10 repos only, for each source
+python gitlab_team_sync.py --env env_gitlab --ac-env ../tenant/env --rows 10
+python github_team_sync.py --env env_github --ac-env ../tenant/env --rows 10
+
+# Same, but actually write to ArmorCode — good for an early "does this really work" check
+# on a small blast radius before running against the full tenant
+python gitlab_team_sync.py --env env_gitlab --ac-env ../tenant/env --rows 10 --apply
+python github_team_sync.py --env env_github --ac-env ../tenant/env --rows 10 --apply
+
+# --rows and --repo can't usefully combine (--repo already limits to one repo);
+# use --rows for a broad small-scale smoke test, --repo for a single known repo
+```
+
+If the token can see fewer than N repos, `--rows` is just an upper bound — the run processes whatever exists and finishes normally, it isn't a hard requirement to have that many repos.
 
 ## Safety defaults
 
