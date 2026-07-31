@@ -4,6 +4,7 @@ Syncs GitHub and GitLab users, and their repo access, into ArmorCode. There are 
 
 - **`sync.py`** — invites SCM contributors as ArmorCode users and tags *existing* sub-products with a `members:...` list. Never invents new sub-products unless `--create-missing-subproducts` is passed.
 - **`github_team_sync.py` / `gitlab_team_sync.py`** — reads ArmorCode team ownership from repo/project topics (`armorcode-team-<name>` on GitHub, `armorcode-team:<name>` on GitLab) and provisions matching Teams, Users, and product/sub-product scope in ArmorCode.
+- **`set_repo_teams.py`** — bulk-applies those `armorcode-team-*` topics to GitLab projects and GitHub repos from a CSV, for setting up the team-sync input at scale instead of one repo at a time.
 
 Both default to `--dry-run`; nothing is written to ArmorCode without `--apply`.
 
@@ -14,6 +15,11 @@ flowchart TB
     subgraph SCM["Source Control"]
         GH["GitHub (PyGithub)"]
         GL["GitLab (python-gitlab)"]
+    end
+
+    subgraph Setup["set_repo_teams.py — one-time topic setup"]
+        CSVIN[["teams.csv<br/>(repo, teams)"]]
+        S0["set_repo_teams.py"]
     end
 
     subgraph Tagging["sync.py — membership tagging"]
@@ -37,6 +43,10 @@ flowchart TB
         CKPT[["sync_checkpoint.json"]]
         INI[["*_team_sync.ini (default_role)"]]
     end
+
+    CSVIN --> S0
+    S0 -->|write armorcode-team topics| GH
+    S0 -->|write armorcode-team topics| GL
 
     GH --> F1
     GL --> F1
@@ -80,6 +90,72 @@ Each script is self-contained (its own inlined ArmorCode client — no shared im
 Both scripts support `--resume`, checkpointing the last-completed repo/project id (sorted ascending — a stable order across runs) to `sync_checkpoint.json` after every repo so a killed run on a very large tenant (e.g. 100,000+ repos) can continue instead of starting over. The checkpoint clears automatically after a full, unfiltered `--apply` run completes. Use distinct `--checkpoint-file` paths if running both sources around the same time — the file is single-source and a run for the other source ignores it.
 
 Both scripts read `default_role` for newly-created users from their own `.ini` file (`github_team_sync.ini` / `gitlab_team_sync.ini`), overridable with `--default-role`.
+
+### Marking a repo with a team
+
+The team-sync scripts only read topics — something has to set them first. A repo can carry more than one team topic; each becomes a separate team the repo's sub-product gets scoped into.
+
+**GitLab** — topics allow mixed case and colons, so the team name is used as-is: `armorcode-team:<Name>`.
+
+```bash
+curl --request PUT --header "PRIVATE-TOKEN: $GITLAB_PAT" \
+  --header "Content-Type: application/json" \
+  --data '{"topics":["armorcode-team:Web","javascript"]}' \
+  "https://gitlab.com/api/v4/projects/julianwayte%2Fjuice-shop"
+```
+
+Or with `python-gitlab`:
+
+```python
+project.topics = ["armorcode-team:Web", "javascript"]
+project.save()
+```
+
+**GitHub** — topics are lowercase-alphanumeric-and-hyphens only (max 50 chars, no colons), so the team name is lowercased and hyphenated: `armorcode-team-<name>`.
+
+```bash
+curl --request PUT --header "Authorization: Bearer $GITHUB_PAT" \
+  --header "Accept: application/vnd.github+json" \
+  --data '{"names":["armorcode-team-api"]}' \
+  "https://api.github.com/repos/jwayte-armorcode/ac-sdk-v2/topics"
+```
+
+**Multiple teams on one repo** — just include more than one `armorcode-team-*` topic:
+
+```bash
+# GitLab
+--data '{"topics":["armorcode-team:Web","armorcode-team:Checkout"]}'
+
+# GitHub
+--data '{"names":["armorcode-team-web","armorcode-team-checkout"]}'
+```
+
+### Bulk-marking repos from a CSV (`set_repo_teams.py`)
+
+Setting topics one repo at a time doesn't scale — `set_repo_teams.py` applies them in bulk from a CSV, merging into whatever topics a repo already has (so a `javascript` topic or an existing team topic for a different team is never silently dropped).
+
+```csv
+source,repo,teams
+gitlab,julianwayte/juice-shop,Web
+github,jwayte-armorcode/ac-sdk-v2,API
+github,jwayte-armorcode/add_jira_mappings,"Ticketing;Support"
+```
+
+- `source`: `gitlab` or `github`
+- `repo`: GitLab uses the full `namespace/path`; GitHub uses `owner/repo`
+- `teams`: one team name, or several separated by `;` inside a quoted field — a bare `,` can't separate multiple teams, since CSV already uses `,` as the column delimiter and an unquoted `Ticketing,Support` would parse as two extra columns instead of two team names
+
+```bash
+# Dry run (default)
+python set_repo_teams.py --csv teams.csv --gitlab-env env_gitlab --github-env env_github
+
+# Apply for real — merges new team topics into what's already there
+python set_repo_teams.py --csv teams.csv --gitlab-env env_gitlab --github-env env_github --apply
+
+# Replace a repo's team topics entirely with the CSV row's teams
+# (non-team topics like "javascript" are still preserved either way)
+python set_repo_teams.py --csv teams.csv --gitlab-env env_gitlab --github-env env_github --apply --replace-all-teams
+```
 
 ## Usage
 
