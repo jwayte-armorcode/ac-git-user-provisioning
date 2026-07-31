@@ -1,0 +1,13 @@
+# Real credentials — never commit. Use env.example as the template.
+env_gitlab
+env_github
+env
+*.env
+
+# Runtime state — regenerated per run, not source
+sync_checkpoint.json
+email_exceptions.csv
+
+# Python
+__pycache__/
+*.pyc
