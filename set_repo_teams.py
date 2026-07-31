@@ -7,9 +7,9 @@ something to read.
 CSV format (header required):
 
     source,repo,teams
-    gitlab,julianwayte/juice-shop,Web
-    github,jwayte-armorcode/ac-sdk-v2,API
-    github,jwayte-armorcode/add_jira_mappings,"Ticketing;Support"
+    gitlab,mygroup/juice-shop,Web
+    github,myorg/ac-sdk-v2,API
+    github,myorg/add_jira_mappings,"Ticketing;Support"
 
 - source: "gitlab" or "github"
 - repo: GitLab uses the full "namespace/path"; GitHub uses "owner/repo"
@@ -174,9 +174,9 @@ def main():
         epilog=(
             "CSV format:\n"
             "  source,repo,teams\n"
-            "  gitlab,julianwayte/juice-shop,Web\n"
-            "  github,jwayte-armorcode/ac-sdk-v2,API\n"
-            "  github,jwayte-armorcode/add_jira_mappings,\"Ticketing;Support\"\n"
+            "  gitlab,mygroup/juice-shop,Web\n"
+            "  github,myorg/ac-sdk-v2,API\n"
+            "  github,myorg/add_jira_mappings,\"Ticketing;Support\"\n"
             "\n"
             "Examples:\n"
             "  python set_repo_teams.py --csv teams.csv\n"

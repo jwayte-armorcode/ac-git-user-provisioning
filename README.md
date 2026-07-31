@@ -1,12 +1,13 @@
 # ac-git-user-provisioning
 
-Syncs GitHub and GitLab users, and their repo access, into ArmorCode. There are two independent pipelines that can be run separately or together:
+Provisions ArmorCode Teams, Users, and product/sub-product scope from GitHub and GitLab repo ownership.
 
-- **`sync.py`** — invites SCM contributors as ArmorCode users and tags *existing* sub-products with a `members:...` list. Never invents new sub-products unless `--create-missing-subproducts` is passed.
-- **`github_team_sync.py` / `gitlab_team_sync.py`** — reads ArmorCode team ownership from repo/project topics (`armorcode-team-<name>` on GitHub, `armorcode-team:<name>` on GitLab) and provisions matching Teams, Users, and product/sub-product scope in ArmorCode.
-- **`set_repo_teams.py`** — bulk-applies those `armorcode-team-*` topics to GitLab projects and GitHub repos from a CSV, for setting up the team-sync input at scale instead of one repo at a time.
+Repos declare their owning team with a topic; `team_sync.py` reads those topics and creates the matching teams, users, and access scope in ArmorCode.
 
-Both default to `--dry-run`; nothing is written to ArmorCode without `--apply`.
+- **`team_sync.py`** — the sync. One entry point for both SCMs, selected with `--source github|gitlab`.
+- **`set_repo_teams.py`** — bulk-applies the `armorcode-team-*` topics to repos from a CSV, for setting up the input at scale instead of one repo at a time.
+
+Dry run is the default; nothing is written to ArmorCode without `--apply`.
 
 ## Design
 
@@ -22,14 +23,10 @@ flowchart TB
         S0["set_repo_teams.py"]
     end
 
-    subgraph Tagging["sync.py — membership tagging"]
-        F1["github_fetcher.py / gitlab_fetcher.py"]
-        S1["sync.py"]
-    end
-
-    subgraph TeamProv["*_team_sync.py — team provisioning"]
-        R1["GitHubTeamReader / GitLabTeamReader<br/>(reads armorcode-team topics)"]
-        S2["github_team_sync.py / gitlab_team_sync.py"]
+    subgraph Sync["team_sync.py — team provisioning"]
+        R1["scm_readers.py<br/>GitHubTeamReader / GitLabTeamReader"]
+        S2["team_sync.py"]
+        ACM["armorcode.py<br/>client + state + merge helpers"]
     end
 
     subgraph AC["ArmorCode Tenant"]
@@ -40,60 +37,54 @@ flowchart TB
 
     subgraph Files["Support Files"]
         CSV[["email_exceptions.csv"]]
-        CKPT[["sync_checkpoint.json"]]
-        INI[["*_team_sync.ini (default_role)"]]
+        CKPT[["sync_checkpoint_&lt;source&gt;.json"]]
+        INI[["team_sync.ini (default_role)"]]
     end
 
     CSVIN --> S0
     S0 -->|write armorcode-team topics| GH
     S0 -->|write armorcode-team topics| GL
 
-    GH --> F1
-    GL --> F1
     GH --> R1
     GL --> R1
-
-    F1 --> S1
     R1 --> S2
-
-    S1 -->|invite missing users| U
-    S1 -->|tag matching sub-product| P
+    S2 --- ACM
 
     S2 -->|create or find user| U
     S2 -->|add user to team| U
     S2 -->|create team / merge scope| T
     S2 -->|match by repo name| P
-    S2 -. no public email .-> CSV
+    S2 -. no resolvable email .-> CSV
     S2 -. resume progress .-> CKPT
     S2 -. default role .-> INI
 
     T --> P
 ```
 
-## `sync.py` flow
+## Flow
 
-1. Fetch every repo the token can see and its members (`github_fetcher.py` / `gitlab_fetcher.py`), falling back to commit-author emails on GitHub when the collaborators endpoint is forbidden.
-2. Pull current ArmorCode users, repos, products, and sub-products via `armorcode_client.py` (a thin wrapper over `ac-sdk-v2`).
-3. Invite any SCM user not already present in ArmorCode by email.
-4. For each repo, look up a sub-product with a matching name and set a `members:<usernames>` tag plus a source tag (`ac-repo-id:...` or `scm-repo:...`). Unmatched repos are skipped and reported unless `--create-missing-subproducts` is passed, in which case a `GitRBAC-Github` / `GitRBAC-Gitlab` product and matching sub-products are created.
-
-## Team-sync flow (`github_team_sync.py` / `gitlab_team_sync.py`)
-
-Each script is self-contained (its own inlined ArmorCode client — no shared import) so either can be handed to a customer independently.
-
-1. Read repo/project topics for the `armorcode-team-*` (GitHub) or `armorcode-team:*` (GitLab) convention to get one or more team names per repo.
+1. Read repo topics for the `armorcode-team-*` (GitHub) or `armorcode-team:*` (GitLab) convention to get one or more team names per repo.
 2. Read members (direct + inherited group members, Reporter+ on GitLab) and split into those with a resolvable email and those without.
 3. For each team name: create the ArmorCode team (scope-only) if missing, or GET the existing team and merge in newly matched product/sub-product scope without dropping anything already scoped.
 4. Create any missing ArmorCode user, then add every member to the team via a GET-merge on the user's `teamInfo` (team membership lives on the user record, not the team).
-5. Members with no public email are appended to `email_exceptions.csv` instead of being silently dropped. Once an admin fills in the email column by hand, `--reprocess-from-exceptions` provisions them and marks the row `reprocessed`.
+5. Members with no resolvable email are appended to `email_exceptions.csv` instead of being silently dropped. Once an admin fills in the email column by hand, `--reprocess-from-exceptions` provisions them and marks the row `reprocessed`.
 
-Both scripts checkpoint automatically — no flag required. Every `--apply` run writes the last-completed repo/project id (sorted ascending — a stable order across runs) to `sync_checkpoint.json` after each repo, and checks for that checkpoint at startup: if one exists, the run resumes right after it instead of starting over; if not (e.g. a plain first-ever run), it just starts from the beginning as normal. This means a killed run on a very large tenant (e.g. 100,000+ repos) can simply be restarted with the exact same command. The checkpoint clears automatically once a full, unfiltered `--apply` run completes. Use distinct `--checkpoint-file` paths if running both sources around the same time — the file is single-source and a run for the other source ignores it.
+Checkpointing is automatic — no flag required. Every `--apply` run writes the last-completed repo id (sorted ascending, a stable order across runs) to `sync_checkpoint_<source>.json` after each repo, and checks for it at startup: if one exists, the run resumes right after it instead of starting over. A killed run on a very large tenant can simply be restarted with the exact same command. The checkpoint clears automatically once a full, unfiltered `--apply` run completes. The default path is per-source, so a GitHub run and a GitLab run never clobber each other's progress.
 
-Both scripts read `default_role` for newly-created users from their own `.ini` file (`github_team_sync.ini` / `gitlab_team_sync.ini`), overridable with `--default-role`.
+### Files
 
-### Marking a repo with a team
+| File | Role |
+|---|---|
+| `team_sync.py` | Entry point, CLI, per-repo sync loop |
+| `scm_readers.py` | `GitHubTeamReader` / `GitLabTeamReader` behind one interface |
+| `armorcode.py` | ArmorCode REST client, cached tenant state, scope/membership merge helpers |
+| `email_exceptions.py` | Read/write the no-email exception CSV |
+| `sync_checkpoint.py` | Resume checkpoint read/write |
+| `set_repo_teams.py` | Bulk topic tagging from a CSV |
 
-The team-sync scripts only read topics — something has to set them first. A repo can carry more than one team topic; each becomes a separate team the repo's sub-product gets scoped into.
+## Marking a repo with a team
+
+`team_sync.py` only reads topics — something has to set them first. A repo can carry more than one team topic; each becomes a separate team the repo's sub-product gets scoped into.
 
 **GitLab** — topics allow mixed case and colons, so the team name is used as-is: `armorcode-team:<Name>`.
 
@@ -101,14 +92,7 @@ The team-sync scripts only read topics — something has to set them first. A re
 curl --request PUT --header "PRIVATE-TOKEN: $GITLAB_PAT" \
   --header "Content-Type: application/json" \
   --data '{"topics":["armorcode-team:Web","javascript"]}' \
-  "https://gitlab.com/api/v4/projects/julianwayte%2Fjuice-shop"
-```
-
-Or with `python-gitlab`:
-
-```python
-project.topics = ["armorcode-team:Web", "javascript"]
-project.save()
+  "https://gitlab.com/api/v4/projects/mygroup%2Fjuice-shop"
 ```
 
 **GitHub** — topics are lowercase-alphanumeric-and-hyphens only (max 50 chars, no colons), so the team name is lowercased and hyphenated: `armorcode-team-<name>`.
@@ -117,7 +101,7 @@ project.save()
 curl --request PUT --header "Authorization: Bearer $GITHUB_PAT" \
   --header "Accept: application/vnd.github+json" \
   --data '{"names":["armorcode-team-api"]}' \
-  "https://api.github.com/repos/jwayte-armorcode/ac-sdk-v2/topics"
+  "https://api.github.com/repos/myorg/my-repo/topics"
 ```
 
 **Multiple teams on one repo** — just include more than one `armorcode-team-*` topic:
@@ -136,9 +120,9 @@ Setting topics one repo at a time doesn't scale — `set_repo_teams.py` applies 
 
 ```csv
 source,repo,teams
-gitlab,julianwayte/juice-shop,Web
-github,jwayte-armorcode/ac-sdk-v2,API
-github,jwayte-armorcode/add_jira_mappings,"Ticketing;Support"
+gitlab,mygroup/juice-shop,Web
+github,myorg/ac-sdk-v2,API
+github,myorg/add_jira_mappings,"Ticketing;Support"
 ```
 
 - `source`: `gitlab` or `github`
@@ -170,86 +154,64 @@ GITLAB_URL=https://gitlab.com
 GITHUB_PAT=github_pat_...
 ```
 
-### `sync.py`
-
-```bash
-# Dry run (default) — see what would happen, nothing written
-python sync.py --source github
-
-# Apply for real — invite missing users, tag existing matching sub-products
-python sync.py --source github --apply
-
-# Both sources in one pass, explicit dry run
-python sync.py --source all --dry-run
-
-# Use a non-default env file
-python sync.py --source gitlab --env ~/my-envfile --apply
-
-# Opt in to creating sub-products for repos with no existing match
-python sync.py --source gitlab --apply --create-missing-subproducts
-```
-
-### `gitlab_team_sync.py` / `github_team_sync.py`
+`TENANT_URL` is required — there is no default tenant, so an unset value is a hard error rather than a run against somewhere unintended.
 
 ```bash
 # Dry run against every repo the token can see
-python gitlab_team_sync.py
-python github_team_sync.py
+python team_sync.py --source github
+python team_sync.py --source gitlab
 
 # One-off test against a single repo before trusting a full run
-python gitlab_team_sync.py --repo juice-shop
-python github_team_sync.py --repo owner/ac-sdk-v2
+python team_sync.py --source github --repo owner/ac-sdk-v2
+python team_sync.py --source gitlab --repo juice-shop
 
 # Apply for real
-python gitlab_team_sync.py --repo juice-shop --apply
-python github_team_sync.py --repo owner/ac-sdk-v2 --apply
+python team_sync.py --source github --repo owner/ac-sdk-v2 --apply
 
 # Full run on a very large tenant — checkpointing is automatic, no flag needed
-python github_team_sync.py --apply
+python team_sync.py --source github --apply
 
 # If it's killed partway through, run the EXACT same command again —
-# it reads sync_checkpoint.json and picks up right after the last completed repo id
-python github_team_sync.py --apply
+# it reads sync_checkpoint_github.json and picks up after the last completed repo
+python team_sync.py --source github --apply
 
 # Override the default role assigned to newly-created ArmorCode users
-python gitlab_team_sync.py --apply --default-role "Security Engineer"
+python team_sync.py --source gitlab --apply --default-role "Security Engineer"
 
 # After an admin fills in an email in email_exceptions.csv, provision that person
-python gitlab_team_sync.py --apply --reprocess-from-exceptions
+python team_sync.py --source gitlab --apply --reprocess-from-exceptions
 ```
+
+The `tenantRole` for newly-created users comes from `team_sync.ini`. `[armorcode]` applies to both sources; add a `[github]` or `[gitlab]` section to give one SCM a different role. `--default-role` overrides both.
 
 ## Testing on a subset of repos
 
-Before trusting a full run on a real tenant, use `--rows N` to cap how many repos/projects get processed — good for an early smoke test across a handful of repos rather than committing to the whole org at once. Unlike `--repo`, which pins to one specific repo, `--rows` takes the first N repos in whatever order the SCM API/sort returns them, so it exercises the "many repos" code path (multiple teams, mixed matched/unmatched sub-products, etc.) at a small, safe scale.
+Before trusting a full run on a real tenant, use `--rows N` to cap how many repos get processed — good for an early smoke test across a handful of repos rather than committing to the whole org at once. Unlike `--repo`, which pins to one specific repo, `--rows` takes the first N repos in id order, so it exercises the "many repos" code path (multiple teams, mixed matched/unmatched sub-products) at a small, safe scale.
 
 ```bash
-# Dry run against the first 10 repos only, for each source
-python gitlab_team_sync.py --rows 10
-python github_team_sync.py --rows 10
+# Dry run against the first 10 repos only
+python team_sync.py --source gitlab --rows 10
+python team_sync.py --source github --rows 10
 
-# Same, but actually write to ArmorCode — good for an early "does this really work" check
-# on a small blast radius before running against the full tenant
-python gitlab_team_sync.py --rows 10 --apply
-python github_team_sync.py --rows 10 --apply
-
-# --rows and --repo can't usefully combine (--repo already limits to one repo);
-# use --rows for a broad small-scale smoke test, --repo for a single known repo
+# Same, but actually write to ArmorCode — an early "does this really work"
+# check on a small blast radius before running against the full tenant
+python team_sync.py --source github --rows 10 --apply
 ```
 
-If the token can see fewer than N repos, `--rows` is just an upper bound — the run processes whatever exists and finishes normally, it isn't a hard requirement to have that many repos.
+If the token can see fewer than N repos, `--rows` is just an upper bound — the run processes whatever exists and finishes normally.
 
 ### What a dry run looks like
 
-`python github_team_sync.py --rows 10` against a tenant where the token can see 7 repos:
+`python team_sync.py --source github --rows 10` against a tenant where the token can see 7 repos:
 
 ```
-[config] new ArmorCode users will be created with role: 'Developer' (from github_team_sync.ini)
+[config] new ArmorCode users will be created with role: 'Developer' (from team_sync.ini)
 [armorcode] Loading teams, users, sub-products, business units...
 [armorcode] Using business unit: 'Default Organization' (id=4044)
 [armorcode] 29 teams, 7 users with email, 36 sub-products
 
 ======================================================================
-  GitHub -> ArmorCode team sync (DRY RUN)
+  github -> ArmorCode team sync (DRY RUN)
 ======================================================================
 
 [github] Fetching and sorting full repo list (by id, for a stable resume order)...
@@ -284,7 +246,7 @@ Reading this output:
 - **`api` matched the existing team `API`.** Team lookup is case-insensitive, because GitHub forces topics to lowercase — so a topic-derived `api` finds an existing `API` instead of creating a duplicate.
 - **Users are listed by name and email**, with `(would be created)` marking anyone not yet in the tenant.
 - **`would merge scope entries` shows the real PUT payload**, with live product and sub-product ids resolved from the tenant.
-- **Nothing is written in a dry run** — no ArmorCode changes, no `sync_checkpoint.json`, no `email_exceptions.csv` rows. The no-email warnings are only logged to that CSV on an `--apply` run.
+- **Nothing is written in a dry run** — no ArmorCode changes, no checkpoint, no `email_exceptions.csv` rows. The no-email warnings are only logged to that CSV on an `--apply` run.
 
 One limitation: dry run reports what it *would* send, not whether that would change anything. `would merge scope entries` prints even when the team is already scoped to those sub-products — on an `--apply` run the same case prints `[noop] scope already covers these sub-products`. To see real change-vs-no-op, run with `--apply`.
 
@@ -321,6 +283,7 @@ Default (non-sparse) is the right choice for an auditable record; reach for `--s
 ## Safety defaults
 
 - Dry run by default; `--apply` is required to write anything.
-- `sync.py` never creates sub-products unless explicitly opted in.
-- Team-sync scripts never drop existing team scope or user team memberships — every write is a GET-merge, never a blind overwrite.
-- Contributors without a resolvable email are logged, not dropped.
+- `TENANT_URL` has no default — an unset value is a hard error, never a run against an unintended tenant.
+- Never drops existing team scope or user team memberships — every write is a GET-merge, never a blind overwrite.
+- Sub-products are never created; a repo with no matching sub-product is reported and its team still provisioned, just without that scope.
+- Contributors without a resolvable email are logged to `email_exceptions.csv`, not dropped.
