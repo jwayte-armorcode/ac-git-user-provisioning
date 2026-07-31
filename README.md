@@ -267,9 +267,8 @@ python team_sync.py --source both --apply
 # user was removed from a team in ArmorCode this run won't add them back).
 python team_sync.py --source both --apply
 
-# Periodic reconcile — ignores the cache and re-checks every team, so the
-# removed user above IS added back. Run this regularly (weekly, say): it is
-# the only thing that repairs drift introduced in the ArmorCode UI.
+# Periodic reconcile — ignores the cache and re-checks every team.
+# Run this regularly (weekly, say) so hand edits (inside ArmorCode) get repaired.
 python team_sync.py --source both --apply --full
 
 # Fast interim pass over only repos touched since a date. Opt-in, and NOT a
