@@ -187,7 +187,34 @@ python team_sync.py --source gitlab --apply --default-role "Security Engineer"
 python team_sync.py --source gitlab --apply --reprocess-from-exceptions
 ```
 
-The `tenantRole` for newly-created users comes from `team_sync.ini`. `[armorcode]` applies to both sources; add a `[github]` or `[gitlab]` section to give one SCM a different role. `--default-role` overrides both.
+### Role for new users
+
+Newly-created ArmorCode users get the `Developer` role by default — both from the shipped `team_sync.ini` and from the built-in fallback, so deleting the ini file doesn't change it. This applies only to users the sync creates; people who already exist in ArmorCode keep whatever role they have.
+
+Precedence, highest first:
+
+| Source | Shipped value |
+|---|---|
+| `--default-role` | unset |
+| `[github]` / `[gitlab]` in `team_sync.ini` | absent (commented out) |
+| `[armorcode]` in `team_sync.ini` | `Developer` |
+| Built-in fallback | `Developer` |
+
+Every run prints which layer won:
+
+```
+[config] new ArmorCode users will be created with role: 'Developer' (from team_sync.ini)
+```
+
+The role is validated against the tenant at startup, before any repos are read or anything is written. An unknown name aborts immediately and lists what's available, rather than failing per-user deep into a run with `400 "Provided Tenant Role Not Found"`:
+
+```
+[error] role 'developer' does not exist in this tenant.
+        Valid roles: Admin, Custom_Developer, DevOps, Developer, Executive, Read Only, Security Engineer
+        Set a valid one via --default-role or default_role in team_sync.ini.
+```
+
+Matching is exact and case-sensitive — `developer` is rejected, `Developer` is accepted. The valid set is tenant-specific and includes any custom roles (typically `Custom_*`), so it's read live from the tenant rather than hardcoded. Dry runs are validated too, so a `--rows 10` preview catches a bad role before the real run.
 
 ## What a dry run looks like
 
@@ -273,6 +300,7 @@ Default (non-sparse) is the right choice for an auditable record; reach for `--s
 
 - Dry run by default; `--apply` is required to write anything.
 - `TENANT_URL` has no default — an unset value is a hard error, never a run against an unintended tenant.
+- The role for new users is validated against the tenant before anything is read or written.
 - Never drops existing team scope or user team memberships — every write is a GET-merge, never a blind overwrite.
 - Sub-products are never created; a repo with no matching sub-product is reported and its team still provisioned, just without that scope.
 - Contributors without a resolvable email are logged to `email_exceptions_<source>.csv`, not dropped.

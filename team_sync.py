@@ -440,6 +440,25 @@ def main():
           f"(from {'--default-role' if args.default_role else args.config})")
 
     ac = ArmorCodeClient(tenant_url=ac_url, token=ac_token)
+
+    # Validate the role up front. Otherwise a wrong name isn't caught until
+    # the first create_user call, which 400s with "Provided Tenant Role Not
+    # Found" — potentially deep into a long run, once teams and scope have
+    # already been written. Checked in dry run too, so a preview catches a
+    # bad --default-role before the real run.
+    try:
+        valid_roles = ac.get_role_names()
+    except Exception as e:
+        print(f"[warn] could not fetch tenant roles to validate {default_role!r}: {e}")
+        print("       continuing — an invalid role will fail at user-creation time instead")
+    else:
+        if default_role not in valid_roles:
+            print(f"[error] role {default_role!r} does not exist in this tenant.")
+            print(f"        Valid roles: {', '.join(sorted(valid_roles))}")
+            print("        Set a valid one via --default-role or default_role in "
+                  f"{args.config}.")
+            sys.exit(1)
+
     state = ArmorCodeState(ac)
 
     if args.reprocess_from_exceptions:

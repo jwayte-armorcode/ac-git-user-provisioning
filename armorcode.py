@@ -212,6 +212,19 @@ class ArmorCodeClient:
         resp.raise_for_status()
         return resp.json()
 
+    def get_role_names(self):
+        """Valid tenantRole names for this tenant, e.g. ['Admin', 'Developer',
+        'Read Only', 'Custom_Developer', ...].
+
+        Each entry from GET /user/roles is a full role object; only the
+        "role" field is the name accepted by create_user's tenant_role.
+        Custom roles appear here too (typically Custom_*), so the list is
+        tenant-specific — never hardcode it.
+        """
+        resp = self._session.get(f"{self.base_url}/user/roles", timeout=self._timeout)
+        resp.raise_for_status()
+        return [r["role"] for r in resp.json() if r.get("role")]
+
     def create_user(self, name, email, tenant_role, *, disable_login=False,
                     team_info=None, extra=None):
         """Create a new user in the tenant."""
