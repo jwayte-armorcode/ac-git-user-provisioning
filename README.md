@@ -226,45 +226,38 @@ GITHUB_PAT=github_pat_...
 `TENANT_URL` is required — there is no default tenant, so an unset value is a hard error rather than a run against somewhere unintended.
 
 ```bash
-# Start here: dry run against the first 10 repos only.
+# Start here: dry run against the first 10 repos of each source.
 # --rows caps how many repos are processed, so a first look at a real tenant
 # has a small blast radius. It's an upper bound — if the token sees fewer
 # than 10 repos the run just processes what exists and finishes normally.
+python team_sync.py --source both --rows 10
+
+# Or one SCM at a time, if you only use one (or want to stage the rollout)
 python team_sync.py --source github --rows 10
 python team_sync.py --source gitlab --rows 10
 
-# Both SCMs in one run. Preferred when you use both: a team owning repos in
-# GitHub AND GitLab becomes one team with the union of its scope and members,
-# whereas two separate runs would each write only their own half.
-python team_sync.py --source both --rows 10
-
 # Same, but actually write to ArmorCode — an early "does this really work"
 # check before committing to the whole org
-python team_sync.py --source github --rows 10 --apply
+python team_sync.py --source both --rows 10 --apply
 
 # One-off test against a single repo. Unlike --rows, this pins to one known
-# repo rather than exercising the many-repos path
+# repo rather than exercising the many-repos path, so it needs a single source
 python team_sync.py --source github --repo owner/ac-sdk-v2
 python team_sync.py --source gitlab --repo juice-shop
 
-# Full run on a very large tenant — spooling/resume is automatic, no flag needed
-python team_sync.py --source github --apply
+# Full run on a very large tenant — spooling/resume is automatic, no flag
+# needed. --source both reads GitHub then GitLab into one picture, so a team
+# owning repos in both becomes ONE team with the union of its scope and
+# members; two separate runs would each write only their own half.
+python team_sync.py --source both --apply
 
-# If it's killed partway through, run the EXACT same command again —
-# it reloads github-repos.csv and picks up after the last spooled repo
-python team_sync.py --source github --apply
+# If it's killed partway through, run the EXACT same command again — each
+# source reloads its own spool (github-repos.csv, gitlab-repos.csv) and picks
+# up after the last spooled repo, so finishing GitHub is never re-done
+python team_sync.py --source both --apply
 
-# Override the default role assigned to newly-created ArmorCode users
-python team_sync.py --source gitlab --apply --default-role "Security Engineer"
-
-# After an admin fills in an email in email_exceptions_<source>.csv, provision that person
-python team_sync.py --source gitlab --apply --reprocess-from-exceptions
-
-# Dump the in-memory picture for review before provisioning anything
-python team_sync.py --source both --dump-json
-
-# Repeat run: teams unchanged since the last run are skipped (see the
-# apply cache below). Fast, but blind to edits made in the ArmorCode UI.
+# Repeat run: teams unchanged since the last run are skipped (see the apply
+# cache below). Fast, but blind to edits made in the ArmorCode UI.
 python team_sync.py --source both --apply
 
 # Periodic reconcile — ignores the cache and re-checks every team.
@@ -274,7 +267,20 @@ python team_sync.py --source both --apply --full
 # Fast interim pass over only repos touched since a date. Opt-in, and NOT a
 # substitute for a full run — see the caveats below.
 python team_sync.py --source both --apply --changed-since 2026-07-01
+
+# Override the default role assigned to newly-created ArmorCode users
+python team_sync.py --source both --apply --default-role "Security Engineer"
+
+# After an admin fills in an email in email_exceptions_<source>.csv, provision
+# that person. Reads the CSV for the source(s) you name, so match the flag to
+# the run that produced it (--source both -> email_exceptions_both.csv)
+python team_sync.py --source both --apply --reprocess-from-exceptions
+
+# Dump the in-memory picture for review before provisioning anything
+python team_sync.py --source both --dump-json
 ```
+
+If you use both GitHub and GitLab, prefer `--source both` for real runs — see below for why it matters. Use a single source when you only have one, or when staging a rollout one SCM at a time.
 
 ### `--source both`
 
