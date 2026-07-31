@@ -173,13 +173,6 @@ python team_sync.py --source github --rows 10 --apply
 python team_sync.py --source github --repo owner/ac-sdk-v2
 python team_sync.py --source gitlab --repo juice-shop
 
-# Dry run against every repo the token can see
-python team_sync.py --source github
-python team_sync.py --source gitlab
-
-# Apply for real
-python team_sync.py --source github --repo owner/ac-sdk-v2 --apply
-
 # Full run on a very large tenant — checkpointing is automatic, no flag needed
 python team_sync.py --source github --apply
 
