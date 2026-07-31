@@ -364,11 +364,14 @@ def main():
                              "file. Must be a valid role in the tenant (e.g. Developer, Admin, "
                              "Security Engineer) — a wrong value returns 400 'Provided Tenant "
                              "Role Not Found'.")
-    parser.add_argument("--exceptions-file", default="email_exceptions.csv",
+    parser.add_argument("--exceptions-file", default=None,
                         help="CSV of members with no resolvable email (default: "
-                             "email_exceptions.csv). They're logged here rather than dropped; "
-                             "once an admin fills in the email column, re-run with "
-                             "--reprocess-from-exceptions to provision them.")
+                             "email_exceptions_<source>.csv). They're logged here rather than "
+                             "dropped; once an admin fills in the email column, re-run with "
+                             "--reprocess-from-exceptions to provision them. Per-source by "
+                             "default because the file is rewritten whole on each update — "
+                             "pointing a concurrent GitHub run and GitLab run at one path "
+                             "would let them silently drop each other's rows.")
     parser.add_argument("--reprocess-from-exceptions", action="store_true",
                         help="Instead of a normal sync, read --exceptions-file and provision "
                              "any row where the email column has been filled in (user created "
@@ -399,10 +402,13 @@ def main():
     dry_run = not args.apply  # default True unless --apply passed
     source = args.source
 
-    # Per-source checkpoint by default: with one entry point for both SCMs,
-    # a shared default path would let a GitHub run and a GitLab run
-    # overwrite each other's progress.
+    # Per-source state files by default: with one entry point for both SCMs,
+    # a shared default path would let a GitHub run and a GitLab run clobber
+    # each other. The checkpoint would resume from the wrong position; the
+    # exceptions CSV is rewritten whole on every update, so two interleaved
+    # runs would silently drop each other's rows.
     checkpoint_file = args.checkpoint_file or f"sync_checkpoint_{source}.json"
+    exceptions_file = args.exceptions_file or f"email_exceptions_{source}.csv"
 
     # One env file holds everything: the qualified key names (GITHUB_PAT vs
     # API_TOKEN/TENANT_URL) don't collide. The legacy bare "token"/"url"
@@ -437,11 +443,11 @@ def main():
     state = ArmorCodeState(ac)
 
     if args.reprocess_from_exceptions:
-        reprocess_exceptions(state, args.exceptions_file, dry_run, default_role)
+        reprocess_exceptions(state, exceptions_file, dry_run, default_role)
         return
 
     sync(reader, state, rows=args.rows, dry_run=dry_run, default_role=default_role,
-         repo=args.repo, exceptions_file=args.exceptions_file,
+         repo=args.repo, exceptions_file=exceptions_file,
          today=date.today().isoformat(), checkpoint_file=checkpoint_file,
          sparse=args.sparse)
 

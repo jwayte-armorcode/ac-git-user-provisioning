@@ -36,7 +36,7 @@ flowchart TB
     end
 
     subgraph Files["Support Files"]
-        CSV[["email_exceptions.csv"]]
+        CSV[["email_exceptions_&lt;source&gt;.csv"]]
         CKPT[["sync_checkpoint_&lt;source&gt;.json"]]
         INI[["team_sync.ini (default_role)"]]
     end
@@ -67,9 +67,9 @@ flowchart TB
 2. Read members (direct + inherited group members, Reporter+ on GitLab) and split into those with a resolvable email and those without.
 3. For each team name: create the ArmorCode team (scope-only) if missing, or GET the existing team and merge in newly matched product/sub-product scope without dropping anything already scoped.
 4. Create any missing ArmorCode user, then add every member to the team via a GET-merge on the user's `teamInfo` (team membership lives on the user record, not the team).
-5. Members with no resolvable email are appended to `email_exceptions.csv` instead of being silently dropped. Once an admin fills in the email column by hand, `--reprocess-from-exceptions` provisions them and marks the row `reprocessed`.
+5. Members with no resolvable email are appended to `email_exceptions_<source>.csv` instead of being silently dropped. Once an admin fills in the email column by hand, `--reprocess-from-exceptions` provisions them and marks the row `reprocessed`.
 
-Checkpointing is automatic — no flag required. Every `--apply` run writes the last-completed repo id (sorted ascending, a stable order across runs) to `sync_checkpoint_<source>.json` after each repo, and checks for it at startup: if one exists, the run resumes right after it instead of starting over. A killed run on a very large tenant can simply be restarted with the exact same command. The checkpoint clears automatically once a full, unfiltered `--apply` run completes. The default path is per-source, so a GitHub run and a GitLab run never clobber each other's progress.
+Checkpointing is automatic — no flag required. Every `--apply` run writes the last-completed repo id (sorted ascending, a stable order across runs) to `sync_checkpoint_<source>.json` after each repo, and checks for it at startup: if one exists, the run resumes right after it instead of starting over. A killed run on a very large tenant can simply be restarted with the exact same command. The checkpoint clears automatically once a full, unfiltered `--apply` run completes. The default path is per-source, so a GitHub run and a GitLab run never clobber each other's progress. `email_exceptions_<source>.csv` is per-source for the same reason: it's rewritten whole on every update, so two concurrent runs sharing one path would silently drop each other's rows. Running both sources at once in separate windows is safe on the defaults — override `--checkpoint-file` / `--exceptions-file` to a shared path only if the runs don't overlap.
 
 ### Files
 
@@ -178,7 +178,7 @@ python team_sync.py --source github --apply
 # Override the default role assigned to newly-created ArmorCode users
 python team_sync.py --source gitlab --apply --default-role "Security Engineer"
 
-# After an admin fills in an email in email_exceptions.csv, provision that person
+# After an admin fills in an email in email_exceptions_<source>.csv, provision that person
 python team_sync.py --source gitlab --apply --reprocess-from-exceptions
 ```
 
@@ -246,7 +246,7 @@ Reading this output:
 - **`api` matched the existing team `API`.** Team lookup is case-insensitive, because GitHub forces topics to lowercase — so a topic-derived `api` finds an existing `API` instead of creating a duplicate.
 - **Users are listed by name and email**, with `(would be created)` marking anyone not yet in the tenant.
 - **`would merge scope entries` shows the real PUT payload**, with live product and sub-product ids resolved from the tenant.
-- **Nothing is written in a dry run** — no ArmorCode changes, no checkpoint, no `email_exceptions.csv` rows. The no-email warnings are only logged to that CSV on an `--apply` run.
+- **Nothing is written in a dry run** — no ArmorCode changes, no checkpoint, no `email_exceptions_<source>.csv` rows. The no-email warnings are only logged to that CSV on an `--apply` run.
 
 One limitation: dry run reports what it *would* send, not whether that would change anything. `would merge scope entries` prints even when the team is already scoped to those sub-products — on an `--apply` run the same case prints `[noop] scope already covers these sub-products`. To see real change-vs-no-op, run with `--apply`.
 
@@ -286,4 +286,4 @@ Default (non-sparse) is the right choice for an auditable record; reach for `--s
 - `TENANT_URL` has no default — an unset value is a hard error, never a run against an unintended tenant.
 - Never drops existing team scope or user team memberships — every write is a GET-merge, never a blind overwrite.
 - Sub-products are never created; a repo with no matching sub-product is reported and its team still provisioned, just without that scope.
-- Contributors without a resolvable email are logged to `email_exceptions.csv`, not dropped.
+- Contributors without a resolvable email are logged to `email_exceptions_<source>.csv`, not dropped.

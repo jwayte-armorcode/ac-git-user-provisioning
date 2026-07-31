@@ -5,9 +5,12 @@ env_github
 env
 *.env
 
-# Runtime state — regenerated per run, not source
-sync_checkpoint.json
-email_exceptions.csv
+# Runtime state — regenerated per run, not source. Both are per-source by
+# default (sync_checkpoint_github.json, email_exceptions_gitlab.csv, ...);
+# the bare names are the pre-split defaults and any --checkpoint-file /
+# --exceptions-file override.
+sync_checkpoint*.json
+email_exceptions*.csv
 
 # Python
 __pycache__/
