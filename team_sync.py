@@ -46,7 +46,7 @@ import time
 from datetime import date, datetime
 
 import email_exceptions
-import sync_checkpoint
+import repo_spool
 from armorcode import (
     ArmorCodeClient,
     ArmorCodeState,
@@ -101,7 +101,7 @@ def write_unmatched_csv(path: str, rows: list[dict]) -> None:
 
     Overwrite rather than append: the file is a report of THIS run, so a
     stale row from an earlier run (for a repo since fixed) would be
-    misleading. Written even when a run resumes from a checkpoint, in which
+    misleading. Written even when a run resumes from a spool, in which
     case it covers only the repos that run actually processed.
     """
     with open(path, "w", newline="") as f:
@@ -112,7 +112,7 @@ def write_unmatched_csv(path: str, rows: list[dict]) -> None:
 
 
 def collect(reader, state: ArmorCodeState, rows: int | None, repo: str | None,
-            checkpoint_file: str, dry_run: bool, unmatched_repos: list[dict],
+            spool_file: str, dry_run: bool, unmatched_repos: list[dict],
             repos_out: dict) -> tuple[int, int]:
     """Read one SCM and accumulate its repo -> {teams, members} mapping.
 
@@ -122,26 +122,33 @@ def collect(reader, state: ArmorCodeState, rows: int | None, repo: str | None,
     once instead of once per repo — a team owning 25 repos previously drove
     25 GET+PUT round trips for the same team.
 
-    Appends to repos_out, keyed "<source>-<full_name>" so GitHub and GitLab
-    repos of the same name can't collide. Returns (repos_seen, repos_with_teams).
+    Every collected repo is spooled to CSV as it's read, and the spool
+    doubles as the resume position: a killed run reloads what it already
+    gathered rather than re-reading it. Appends to repos_out, keyed
+    "<source>-<full_name>" so GitHub and GitLab repos of the same name can't
+    collide. Returns (repos_seen, repos_with_teams).
     """
     source = reader.source
-    print(f"\n[{source}] Fetching and sorting full repo list "
+
+    # Recover anything a previous run spooled BEFORE listing repos, so the
+    # resume position is known up front. The spool holds the collected data
+    # itself, not just a position — a position alone would let a resumed run
+    # skip repos whose teams and members were only ever in the dead run's
+    # memory, silently provisioning from a fraction of the tenant.
+    spool = repo_spool.RepoSpool(spool_file, source)
+    recovered, after_id, data_rows = spool.load()
+    if after_id is not None:
+        repos_out.update(recovered)
+        print(f"\n[resume] {source}: reloaded {data_rows} repo(s) with teams from "
+              f"{spool_file}, resuming after repo id {after_id}")
+    else:
+        print(f"\n[resume] {source}: no spool found — starting from the beginning")
+
+    print(f"[{source}] Fetching and sorting full repo list "
           f"(by id, for a stable resume order)...")
     all_repos = reader.load_repos(repo=repo)
     total_count = len(all_repos)
     print(f"[{source}] {total_count} repo(s) visible to this token")
-
-    # Checkpointing is always on — every run checks for a prior checkpoint
-    # and resumes from it automatically, no flag required. A run that
-    # completes in full (no --repo/--rows filter) clears the checkpoint at
-    # the end, so a plain first-ever run just proceeds normally: no
-    # checkpoint file exists yet, so after_id is None and nothing is skipped.
-    after_id = sync_checkpoint.load_checkpoint(checkpoint_file, source)
-    if after_id is not None:
-        print(f"[resume] Checkpoint found: resuming after repo id {after_id}")
-    else:
-        print(f"[resume] No checkpoint found for {source} — starting from the beginning")
 
     repos_seen = 0
     repos_with_teams = 0
@@ -155,6 +162,27 @@ def collect(reader, state: ArmorCodeState, rows: int | None, repo: str | None,
     if rows is not None:
         to_process = min(to_process, rows)
     started_at = time.monotonic()
+
+    # Dry runs never write the spool — previewing must not create a resume
+    # position that makes the next real run skip repos it never provisioned.
+    if not dry_run:
+        spool.open_append()
+    try:
+        repos_seen, repos_with_teams = _collect_loop(
+            reader, state, all_repos, rows, after_id, dry_run, spool,
+            unmatched_repos, repos_out, to_process, total_count, started_at,
+        )
+    finally:
+        spool.close()
+    return repos_seen, repos_with_teams
+
+
+def _collect_loop(reader, state, all_repos, rows, after_id, dry_run, spool,
+                  unmatched_repos, repos_out, to_process, total_count, started_at):
+    """The per-repo read loop. Split out so the spool is always closed."""
+    source = reader.source
+    repos_seen = 0
+    repos_with_teams = 0
 
     for scm_repo in reader.iter_repos(all_repos, rows=rows, after_id=after_id):
         repos_seen += 1
@@ -179,16 +207,11 @@ def collect(reader, state: ArmorCodeState, rows: int | None, repo: str | None,
 
         team_names = reader.get_team_names(scm_repo)
 
-        # The checkpoint records SCM-read progress. Collect is the only phase
-        # that walks repos, so it stays here — but it's now only meaningful
-        # for the read half; the apply phase is keyed on teams, not repos.
-        if not dry_run:
-            sync_checkpoint.save_checkpoint(
-                checkpoint_file, source, repo_id, repos_seen, total_count,
-                datetime.now().isoformat(),
-            )
-
         if not team_names:
+            # Nothing to provision, but advance the resume position so a long
+            # stretch of untagged repos isn't re-read after a crash.
+            if not dry_run:
+                spool.append_progress(repo_id)
             continue
 
         repos_with_teams += 1
@@ -220,7 +243,7 @@ def collect(reader, state: ArmorCodeState, rows: int | None, repo: str | None,
             names = ", ".join(f"{m['name']} ({m['username']})" for m in members_missing_email)
             print(f"    [warn] skipped (no public email, cannot provision): {names}")
 
-        repos_out[f"{source}-{full_name}"] = {
+        entry = {
             "source": source,
             "repo": full_name,
             "repo_name": repo_name,
@@ -229,6 +252,9 @@ def collect(reader, state: ArmorCodeState, rows: int | None, repo: str | None,
             "members_missing_email": members_missing_email,
             "sub_product_ids": [sp["id"] for sp in sub_products],
         }
+        repos_out[f"{source}-{full_name}"] = entry
+        if not dry_run:
+            spool.append(repo_id, entry)
 
     return repos_seen, repos_with_teams
 
@@ -451,7 +477,7 @@ def apply_teams(ac, state, teams: dict, user_records: dict, default_role: str,
 
 def sync(readers: list, state: ArmorCodeState, rows: int | None, dry_run: bool,
          default_role: str, repo: str | None, exceptions_file: str, today: str,
-         checkpoint_files: dict, sparse: bool = False, unmatched_csv: str | None = None,
+         spool_files: dict, sparse: bool = False, unmatched_csv: str | None = None,
          dump_json: bool = False) -> None:
     """Two-phase sync: read every SCM into memory, then provision once per team.
 
@@ -471,10 +497,13 @@ def sync(readers: list, state: ArmorCodeState, rows: int | None, dry_run: bool,
     total_seen = 0
     total_with_teams = 0
 
+    # Sources are read in a fixed order (github then gitlab) so a resumed run
+    # picks up deterministically. Each keeps its own spool, so a crash partway
+    # through GitLab doesn't re-read the 50,000 GitHub repos already gathered.
     for reader in readers:
         seen, with_teams = collect(
             reader, state, rows=rows, repo=repo,
-            checkpoint_file=checkpoint_files[reader.source], dry_run=dry_run,
+            spool_file=spool_files[reader.source], dry_run=dry_run,
             unmatched_repos=unmatched_repos, repos_out=repos,
         )
         total_seen += seen
@@ -519,13 +548,20 @@ def sync(readers: list, state: ArmorCodeState, rows: int | None, dry_run: bool,
         print(f"\n  All matched — wrote empty {unmatched_csv}")
     print(f"{'='*70}\n")
 
-    # A full, unfiltered, non-dry-run pass reached the end without being
-    # killed — clear the checkpoints so a later fresh run doesn't skip
-    # anything because a stale "last completed" position is still on disk.
+    # Discard the spools only now — after collect AND apply both finished. The
+    # spool is the durable record of collected work, so removing it earlier
+    # (e.g. at the end of collect) would mean a crash during apply lost
+    # everything and the next run silently started over.
+    #
+    # Filtered runs keep their spool: --repo/--rows covered only part of the
+    # tenant, so that position isn't a valid "we got this far" marker.
     if not dry_run and repo is None and rows is None:
         for reader in readers:
-            sync_checkpoint.clear_checkpoint(checkpoint_files[reader.source])
-        print("[resume] Full run completed — checkpoint(s) cleared")
+            repo_spool.RepoSpool(spool_files[reader.source], reader.source).discard()
+        print("[resume] Full run completed — spool(s) cleared")
+    elif not dry_run:
+        kept = ", ".join(spool_files[r.source] for r in readers)
+        print(f"[resume] Filtered run (--repo/--rows) — spool(s) kept: {kept}")
 
 
 def reprocess_exceptions(state: ArmorCodeState, exceptions_file: str, dry_run: bool,
@@ -633,14 +669,17 @@ def main():
                         help="Instead of a normal sync, read --exceptions-file and provision "
                              "any row where the email column has been filled in (user created "
                              "if needed, added to the row's team). Does not re-scope teams.")
-    parser.add_argument("--checkpoint-file", default=None,
-                        help="Path to the resume checkpoint (default: "
-                             "sync_checkpoint_<source>.json, so a GitHub run and a GitLab run "
-                             "never clobber each other's progress). Every --apply run writes "
-                             "progress here after each repo and checks it at startup: if it "
-                             "exists, the run resumes after that repo id instead of starting "
-                             "over. A full run that completes with no --repo/--rows filter "
-                             "clears it. Dry runs never write it.")
+    parser.add_argument("--spool-file", default=None,
+                        help="Path to the resume spool (default: "
+                             "<source>-repos.csv, e.g. github-repos.csv). Every --apply run "
+                             "appends each collected repo here as it is read — teams, members "
+                             "and matched sub-products — and reloads it at startup, resuming "
+                             "after the highest repo id present. The spool holds the collected "
+                             "DATA, not just a position, so a run killed after 99,000 of "
+                             "100,000 repos restarts by re-reading only the last 1,000 rather "
+                             "than losing the work or provisioning from a fraction of the "
+                             "tenant. Cleared once a full unfiltered run finishes applying. "
+                             "Dry runs never write it.")
     parser.add_argument("--unmatched-csv", nargs="?", const="unmatched_repos.csv",
                         default=None, metavar="PATH",
                         help="Also write the repos that had a team topic but no matching "
@@ -679,20 +718,21 @@ def main():
 
     # Per-source state files by default: with one entry point for both SCMs,
     # a shared default path would let a GitHub run and a GitLab run clobber
-    # each other. The checkpoint would resume from the wrong position; the
+    # each other. The spool would resume from the wrong position; the
     # exceptions CSV is rewritten whole on every update, so two interleaved
     # runs would silently drop each other's rows.
     #
-    # The checkpoint stays per-SCM even under --source both, because it
-    # records SCM-read progress and each SCM is read separately. A single
-    # combined file couldn't express "GitHub done, GitLab halfway".
-    if args.checkpoint_file and source == "both":
-        print("[error] --checkpoint-file cannot be used with --source both "
-              "(each SCM needs its own checkpoint; omit the flag to use the "
+    # The spool stays per-SCM even under --source both: each SCM is read
+    # separately, so a crash partway through GitLab must not re-read the
+    # GitHub repos already gathered. A single combined file couldn't express
+    # "GitHub done, GitLab halfway".
+    if args.spool_file and source == "both":
+        print("[error] --spool-file cannot be used with --source both "
+              "(each SCM needs its own spool; omit the flag to use the "
               "per-source defaults)")
         sys.exit(1)
-    checkpoint_files = {
-        s: (args.checkpoint_file or f"sync_checkpoint_{s}.json") for s in sources
+    spool_files = {
+        s: (args.spool_file or f"{s}-repos.csv") for s in sources
     }
     exceptions_file = args.exceptions_file or f"email_exceptions_{source}.csv"
 
@@ -768,7 +808,7 @@ def main():
 
     sync(readers, state, rows=args.rows, dry_run=dry_run, default_role=default_role,
          repo=args.repo, exceptions_file=exceptions_file,
-         today=date.today().isoformat(), checkpoint_files=checkpoint_files,
+         today=date.today().isoformat(), spool_files=spool_files,
          sparse=args.sparse, unmatched_csv=args.unmatched_csv,
          dump_json=args.dump_json)
 

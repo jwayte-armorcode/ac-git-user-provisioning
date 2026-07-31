@@ -39,7 +39,7 @@ flowchart TB
 
     subgraph Files["Support Files"]
         CSV[["email_exceptions_&lt;source&gt;.csv"]]
-        CKPT[["sync_checkpoint_&lt;source&gt;.json"]]
+        CKPT[["&lt;source&gt;-repos.csv (spool)"]]
         INI[["team_sync.ini (default_role)"]]
     end
 
@@ -91,7 +91,23 @@ Aggregating before provisioning is what keeps the run cheap. A team owning 25 re
 
 It also makes the scope write more correct: a team's complete sub-product set is computed in memory and written in a single merge, instead of growing through 25 sequential read-merge-write round trips.
 
-Checkpointing is automatic — no flag required. Every `--apply` run writes the last-completed repo id (sorted ascending, a stable order across runs) to `sync_checkpoint_<source>.json` after each repo, and checks for it at startup: if one exists, the run resumes right after it instead of starting over. A killed run on a very large tenant can simply be restarted with the exact same command. The checkpoint clears automatically once a full, unfiltered `--apply` run completes. The default path is per-source, so a GitHub run and a GitLab run never clobber each other's progress. `email_exceptions_<source>.csv` is per-source for the same reason: it's rewritten whole on every update, so two concurrent runs sharing one path would silently drop each other's rows. Running both sources at once in separate windows is safe on the defaults — override `--checkpoint-file` / `--exceptions-file` to a shared path only if the runs don't overlap.
+### Resume after a crash
+
+Collecting 100,000 repos takes hours, so the collect phase spools each repo to CSV as it reads it — `github-repos.csv` and `gitlab-repos.csv` — flushed and `fsync`ed per row. On restart the run reloads those rows and continues after the highest repo id present.
+
+The spool holds the collected **data**, not just a position. That distinction is the whole point: a position-only checkpoint would tell a resumed run "99,000 repos done" while their teams and members existed only in the dead run's memory — so it would provision from the last 1,000 and silently drop the rest, while looking like it succeeded.
+
+```
+[resume] github: reloaded 41,802 repo(s) with teams from github-repos.csv, resuming after repo id 743119288
+```
+
+Sources are read in a fixed order (GitHub, then GitLab) and each keeps its own spool, so dying partway through GitLab doesn't re-read the 50,000 GitHub repos already gathered. Repos with no team topic contribute no data, but still advance the resume position, so a long stretch of untagged repos isn't re-read either.
+
+The spool is deleted only after collect **and** apply have both finished — clearing it any earlier would mean a crash during apply lost everything. A `--repo`/`--rows` run keeps its spool, since a partial pass isn't a valid "we got this far" marker. Dry runs never write one.
+
+A hard kill can leave a half-written final line. That row is detected and dropped, so its repo is simply re-read — safe, because collect is idempotent.
+
+`email_exceptions_<source>.csv` is per-source too, for a different reason: it's rewritten whole on every update, so two concurrent runs sharing one path would silently drop each other's rows. Running both sources at once in separate windows is safe on the defaults.
 
 ### Files
 
@@ -101,7 +117,7 @@ Checkpointing is automatic — no flag required. Every `--apply` run writes the 
 | `scm_readers.py` | `GitHubTeamReader` / `GitLabTeamReader` behind one interface |
 | `armorcode.py` | ArmorCode REST client, cached tenant state, scope/membership merge helpers |
 | `email_exceptions.py` | Read/write the no-email exception CSV |
-| `sync_checkpoint.py` | Resume checkpoint read/write |
+| `repo_spool.py` | Durable per-repo CSV spool, and resume from it |
 | `set_repo_teams.py` | Bulk topic tagging from a CSV |
 
 ## Marking a repo with a team
@@ -200,11 +216,11 @@ python team_sync.py --source github --rows 10 --apply
 python team_sync.py --source github --repo owner/ac-sdk-v2
 python team_sync.py --source gitlab --repo juice-shop
 
-# Full run on a very large tenant — checkpointing is automatic, no flag needed
+# Full run on a very large tenant — spooling/resume is automatic, no flag needed
 python team_sync.py --source github --apply
 
 # If it's killed partway through, run the EXACT same command again —
-# it reads sync_checkpoint_github.json and picks up after the last completed repo
+# it reloads github-repos.csv and picks up after the last spooled repo
 python team_sync.py --source github --apply
 
 # Override the default role assigned to newly-created ArmorCode users
@@ -221,7 +237,7 @@ python team_sync.py --source both --dump-json
 
 `both` reads GitHub and GitLab in the collect phase, then provisions from the combined picture. Teams are keyed on **name alone**, so `armorcode-team-payments` on a GitHub repo and `armorcode-team:Payments` on a GitLab project resolve to the same ArmorCode team, which ends up scoped to the sub-products of both. Users are deduplicated on lowercased email across sources.
 
-Each SCM keeps its own checkpoint (`sync_checkpoint_github.json`, `sync_checkpoint_gitlab.json`) because they're read separately and a single file couldn't express "GitHub done, GitLab halfway" — so `--checkpoint-file` is rejected with `--source both`. The exceptions CSV defaults to `email_exceptions_both.csv`.
+Each SCM keeps its own spool (`github-repos.csv`, `gitlab-repos.csv`) because they're read separately and a single file couldn't express "GitHub done, GitLab halfway" — so `--spool-file` is rejected with `--source both`. The exceptions CSV defaults to `email_exceptions_both.csv`.
 
 Since `both` provisions one shared user pool, only `[armorcode] default_role` applies; per-source `[github]`/`[gitlab]` sections are ignored, with a warning if they're set.
 
@@ -272,31 +288,47 @@ Matching is exact and case-sensitive — `developer` is rejected, `Developer` is
   github -> ArmorCode team sync (DRY RUN)
 ======================================================================
 
+[resume] github: no spool found — starting from the beginning
 [github] Fetching and sorting full repo list (by id, for a stable resume order)...
 [github] 7 repo(s) visible to this token
-[resume] No checkpoint found for github — starting from the beginning
 
 [repo] acme-org/add_jira_mappings  (teams: ticketing)
     members: 3 total, 1 with email, 2 without (cannot provision without email)
     [info] matched sub-product: add_jira_mappings (id=3392790)
-    [team] ticketing exists (id=132640)
-      [dry_run] would merge scope entries: [{'product': 762317, 'subProduct': [3392790], 'accessOnAllSubProduct': False}]
-      [dry_run] would ensure 2 member(s) on team:
-        - Ana Ruiz <ana.ruiz@example.com>
-        - New Person <new.person@example.com> (would be created)
     [warn] skipped (no public email, cannot provision): sam-lee (sam-lee), dev-bot (dev-bot)
 
 [repo] acme-org/ac-sdk-v2  (teams: api)
     members: 1 total, 0 with email, 1 without (cannot provision without email)
     [info] matched sub-product: ac-sdk-v2 (id=3392789)
-    [team] API exists (id=132604)
-      [dry_run] would merge scope entries: [{'product': 762317, 'subProduct': [3392789], 'accessOnAllSubProduct': False}]
     [warn] skipped (no public email, cannot provision): dev-bot (dev-bot)
 
+----------------------------------------------------------------------
+  Users: 2 distinct member(s) with a resolvable email
+----------------------------------------------------------------------
+  [dry_run] 1 already exist, 1 would be created:
+    - New Person <new.person@example.com>
+
+----------------------------------------------------------------------
+  Teams: 2
+----------------------------------------------------------------------
+
+[team] api  (1 repo(s), 0 member(s), 1 sub-product(s))
+    [team] exists (id=132604)
+      [dry_run] would merge scope entries: [{'product': 762317, 'subProduct': [3392789], 'accessOnAllSubProduct': False}]
+
+[team] ticketing  (1 repo(s), 2 member(s), 1 sub-product(s))
+    [team] exists (id=132640)
+      [dry_run] would merge scope entries: [{'product': 762317, 'subProduct': [3392790], 'accessOnAllSubProduct': False}]
+      [dry_run] would ensure 2 member(s) on team:
+        - Ana Ruiz <ana.ruiz@example.com>
+        - New Person <new.person@example.com> (would be created)
+
 ======================================================================
-  Done. 7 repo(s) scanned, 2 had armorcode-team topics.
+  Done. 7 repo(s) scanned, 2 had armorcode-team topics -> 2 team(s), 2 user(s).
 ======================================================================
 ```
+
+The two phases are visible: the per-repo block is the collect phase reading the SCM, then `Users:` and `Teams:` are the apply phase working from the aggregated maps.
 
 Reading this output:
 
@@ -304,7 +336,7 @@ Reading this output:
 - **`api` matched the existing team `API`.** Team lookup is case-insensitive, because GitHub forces topics to lowercase — so a topic-derived `api` finds an existing `API` instead of creating a duplicate.
 - **Users are listed by name and email**, with `(would be created)` marking anyone not yet in the tenant.
 - **`would merge scope entries` shows the real PUT payload**, with live product and sub-product ids resolved from the tenant.
-- **Nothing is written in a dry run** — no ArmorCode changes, no checkpoint, no `email_exceptions_<source>.csv` rows. The no-email warnings are only logged to that CSV on an `--apply` run.
+- **Nothing is written in a dry run** — no ArmorCode changes, no spool, no `email_exceptions_<source>.csv` rows. The no-email warnings are only logged to that CSV on an `--apply` run.
 
 ### Progress and rate limits
 
@@ -314,7 +346,7 @@ Every 25 repos the run prints a heartbeat, so a large tenant shows movement inst
 [progress] 2500/98431 repos (3%), 214 with team topics, 1.8 repo/s, ~14h50m remaining
 ```
 
-The denominator is what *this* run will process, so it accounts for `--rows` and for repos already skipped on a checkpoint resume. The rate and ETA are running averages from the start of the run.
+The denominator is what *this* run will process, so it accounts for `--rows` and for repos already skipped on a spool resume. The rate and ETA are running averages from the start of the run.
 
 ArmorCode enforces these limits:
 
@@ -369,7 +401,7 @@ github,acme-org/add_jira_mappings,add_jira_mappings,ticketing
 github,acme-org/ac-sdk-v2,ac-sdk-v2,api
 ```
 
-The file reports that single run, so it's overwritten each time rather than appended — including a header-only file when everything matched, so a previous run's rows can't linger and misreport repos that have since been fixed. It's written in dry runs too, which makes `--rows N --unmatched-csv` a cheap way to plan the missing sub-products before writing anything. Note that a run resuming from a checkpoint only covers the repos it actually processed.
+The file reports that single run, so it's overwritten each time rather than appended — including a header-only file when everything matched, so a previous run's rows can't linger and misreport repos that have since been fixed. It's written in dry runs too, which makes `--rows N --unmatched-csv` a cheap way to plan the missing sub-products before writing anything. Note that a run resuming from a spool only covers the repos it actually re-read.
 
 One limitation: dry run reports what it *would* send, not whether that would change anything. `would merge scope entries` prints even when the team is already scoped to those sub-products — on an `--apply` run the same case prints `[noop] scope already covers these sub-products`. To see real change-vs-no-op, run with `--apply`.
 

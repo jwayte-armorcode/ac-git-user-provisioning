@@ -10,6 +10,7 @@ env
 # the bare names are the pre-split defaults and any --checkpoint-file /
 # --exceptions-file override.
 sync_checkpoint*.json
+*-repos.csv
 email_exceptions*.csv
 unmatched_repos*.csv
 repos.json
