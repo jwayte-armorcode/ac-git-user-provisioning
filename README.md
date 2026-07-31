@@ -7,7 +7,7 @@ Repos declare their owning team with a topic; `team_sync.py` reads those topics 
 - **`team_sync.py`** — the sync. One entry point, selected with `--source github|gitlab|both`.
 - **`set_repo_teams.py`** — bulk-applies the `armorcode-team-*` topics to repos from a CSV, for setting up the input at scale instead of one repo at a time.
 
-Dry run is the default; nothing is written to ArmorCode without `--apply`.
+Dry run is the default; nothing is written to ArmorCode without `--apply`. The sync is **additive-only** — it grants access, and never revokes it. See [The sync only ever adds](#the-sync-only-ever-adds).
 
 ## Design
 
@@ -486,12 +486,36 @@ Unlike a dry run, apply reports whether each write actually changed anything —
 
 Default (non-sparse) is the right choice for an auditable record; reach for `--sparse` on very large tenants where per-user output would otherwise dominate the log.
 
+## The sync only ever adds
+
+This tool is **additive-only**. It never removes a user from a team, never removes sub-product scope from a team, and never deletes a team or user. There are no `DELETE` calls in the codebase at all, and the two endpoints that replace a whole list — `PUT /api/team` for scope and `PUT /user/update/user` for membership — always have their bodies built by union, never by assignment:
+
+```
+team already scoped to subs 1,2,3 (product 700) + sub 50 (product 800)
+sync computes that it wants sub 9 (product 700)
+result: product 700 -> [1,2,3,9]   product 800 -> [50]      # nothing lost
+```
+
+```
+user already on teams 10 (Developer), 11 (Admin)
+sync adds team 12
+result: [10 Developer, 11 Admin, 12 Developer]              # roles preserved too
+```
+
+**Why.** A repo topic states who *should* have access; it says nothing about who shouldn't. The token may not even see every repo in the org, so absence from the collected set is not evidence that access should be revoked. Removing on that basis could silently strip access from people whose repos this run simply couldn't read.
+
+**What this means in practice:**
+
+- **De-provisioning is out of scope.** If someone leaves a team, remove them in ArmorCode — no run will do it for you. Deleting the repo topic stops *future* runs from re-adding them, but does not undo what's already there.
+- A member added by hand in the ArmorCode UI is never removed by the sync, so the end state converges toward "what the repos say **plus** whatever was already there", not a strict mirror of the repos.
+- `--full` therefore repairs **removals** but not **additions**: a member deleted from a team in the UI is put back, because the repos still say they belong; a member added in the UI stays.
+
 ## Safety defaults
 
 - Dry run by default; `--apply` is required to write anything.
 - `TENANT_URL` has no default — an unset value is a hard error, never a run against an unintended tenant.
 - The role for new users is validated against the tenant before anything is read or written.
-- Never drops existing team scope or user team memberships — every write is a GET-merge, never a blind overwrite.
+- Never drops existing team scope or user team memberships — every write is a GET-merge, never a blind overwrite. The sync only ever adds; see [The sync only ever adds](#the-sync-only-ever-adds) for what that means for de-provisioning.
 - Sub-products are never created; a repo with no matching sub-product is reported inline *and* re-listed in the run summary, with its team still provisioned, just without that scope.
 - Contributors without a resolvable email are logged to `email_exceptions_<source>.csv`, not dropped.
 - Requests are paced under ArmorCode's per-endpoint rate limit, and a 429 is waited out rather than aborting the run.
