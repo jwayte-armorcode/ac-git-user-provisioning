@@ -87,7 +87,7 @@ Each script is self-contained (its own inlined ArmorCode client — no shared im
 4. Create any missing ArmorCode user, then add every member to the team via a GET-merge on the user's `teamInfo` (team membership lives on the user record, not the team).
 5. Members with no public email are appended to `email_exceptions.csv` instead of being silently dropped. Once an admin fills in the email column by hand, `--reprocess-from-exceptions` provisions them and marks the row `reprocessed`.
 
-Both scripts support `--resume`, checkpointing the last-completed repo/project id (sorted ascending — a stable order across runs) to `sync_checkpoint.json` after every repo so a killed run on a very large tenant (e.g. 100,000+ repos) can continue instead of starting over. The checkpoint clears automatically after a full, unfiltered `--apply` run completes. Use distinct `--checkpoint-file` paths if running both sources around the same time — the file is single-source and a run for the other source ignores it.
+Both scripts checkpoint automatically — no flag required. Every `--apply` run writes the last-completed repo/project id (sorted ascending — a stable order across runs) to `sync_checkpoint.json` after each repo, and checks for that checkpoint at startup: if one exists, the run resumes right after it instead of starting over; if not (e.g. a plain first-ever run), it just starts from the beginning as normal. This means a killed run on a very large tenant (e.g. 100,000+ repos) can simply be restarted with the exact same command. The checkpoint clears automatically once a full, unfiltered `--apply` run completes. Use distinct `--checkpoint-file` paths if running both sources around the same time — the file is single-source and a run for the other source ignores it.
 
 Both scripts read `default_role` for newly-created users from their own `.ini` file (`github_team_sync.ini` / `gitlab_team_sync.ini`), overridable with `--default-role`.
 
@@ -195,11 +195,12 @@ python github_team_sync.py --env env_github --ac-env ../tenant/env --repo owner/
 python gitlab_team_sync.py --env env_gitlab --ac-env ../tenant/env --repo juice-shop --apply
 python github_team_sync.py --env env_github --ac-env ../tenant/env --repo owner/ac-sdk-v2 --apply
 
-# Full run on a very large tenant, resumable if killed partway through
-python github_team_sync.py --env env_github --ac-env ../tenant/env --apply --resume
+# Full run on a very large tenant — checkpointing is automatic, no flag needed
+python github_team_sync.py --env env_github --ac-env ../tenant/env --apply
 
-# Re-run after a kill — picks up after the last completed repo id automatically
-python github_team_sync.py --env env_github --ac-env ../tenant/env --apply --resume
+# If it's killed partway through, run the EXACT same command again —
+# it reads sync_checkpoint.json and picks up right after the last completed repo id
+python github_team_sync.py --env env_github --ac-env ../tenant/env --apply
 
 # Override the default role assigned to newly-created ArmorCode users
 python gitlab_team_sync.py --env env_gitlab --ac-env ../tenant/env --apply --default-role "Security Engineer"

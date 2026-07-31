@@ -387,7 +387,7 @@ class GitHubTeamReader:
         applying resume-skip and a row cap.
 
         after_id: optional resume point — skip every repo with
-              id <= after_id (used by --resume).
+              id <= after_id (set automatically from the checkpoint file, if one exists).
         rows: optional cap on how many (post-skip) repos to yield.
         """
         count = 0
@@ -701,7 +701,7 @@ def add_user_to_team(ac: ArmorCodeClient, user_record: dict, team_id: int, role:
 def sync(gh_reader: GitHubTeamReader, state: ArmorCodeState, rows: int | None, dry_run: bool,
          default_role: str = "Developer", repo: str | None = None,
          exceptions_file: str = "email_exceptions.csv", today: str = "",
-         resume: bool = False, checkpoint_file: str = "sync_checkpoint.json"):
+         checkpoint_file: str = "sync_checkpoint.json"):
     ac = state.ac
     mode = "DRY RUN" if dry_run else "APPLY"
     print(f"\n{'='*70}\n  GitHub -> ArmorCode team sync ({mode})\n{'='*70}\n")
@@ -713,13 +713,16 @@ def sync(gh_reader: GitHubTeamReader, state: ArmorCodeState, rows: int | None, d
     total_count = len(all_repos)
     print(f"[github] {total_count} repo(s) visible to this token")
 
-    after_id = None
-    if resume:
-        after_id = sync_checkpoint.load_checkpoint(checkpoint_file, "github")
-        if after_id is not None:
-            print(f"[resume] Checkpoint found: resuming after repo id {after_id}")
-        else:
-            print("[resume] No checkpoint found for github — starting from the beginning")
+    # Checkpointing is always on — every run checks for a prior checkpoint
+    # and resumes from it automatically, no flag required. A run that
+    # completes in full (no --repo/--rows filter) clears the checkpoint at
+    # the end, so a plain first-ever run just proceeds normally: no
+    # checkpoint file exists yet, so after_id is None and nothing is skipped.
+    after_id = sync_checkpoint.load_checkpoint(checkpoint_file, "github")
+    if after_id is not None:
+        print(f"[resume] Checkpoint found: resuming after repo id {after_id}")
+    else:
+        print("[resume] No checkpoint found for github — starting from the beginning")
 
     repos_seen = 0
     repos_with_teams = 0
@@ -733,7 +736,7 @@ def sync(gh_reader: GitHubTeamReader, state: ArmorCodeState, rows: int | None, d
 
         if not team_names:
             last_completed_id = gh_repo.id
-            if resume and not dry_run:
+            if not dry_run:
                 sync_checkpoint.save_checkpoint(
                     checkpoint_file, "github", last_completed_id, repos_seen, total_count,
                     datetime.now().isoformat(),
@@ -852,7 +855,7 @@ def sync(gh_reader: GitHubTeamReader, state: ArmorCodeState, rows: int | None, d
             print(f"    [warn] skipped (no public email, cannot provision): {names}")
 
         last_completed_id = gh_repo.id
-        if resume and not dry_run:
+        if not dry_run:
             sync_checkpoint.save_checkpoint(
                 checkpoint_file, "github", last_completed_id, repos_seen, total_count,
                 datetime.now().isoformat(),
@@ -865,7 +868,7 @@ def sync(gh_reader: GitHubTeamReader, state: ArmorCodeState, rows: int | None, d
     # A full, unfiltered, non-dry-run pass reached the end without being
     # killed — clear the checkpoint so a later fresh run doesn't skip
     # anything because a stale "last completed" position is still on disk.
-    if resume and not dry_run and repo is None and rows is None:
+    if not dry_run and repo is None and rows is None:
         sync_checkpoint.clear_checkpoint(checkpoint_file)
         print("[resume] Full run completed — checkpoint cleared")
 
@@ -964,24 +967,22 @@ def main():
                         help="Instead of a normal sync, read --exceptions-file and provision "
                              "any row where the email column has been filled in (user created "
                              "if needed, added to the row's team). Does not re-scope teams.")
-    parser.add_argument("--resume", action="store_true",
-                        help="Track progress in --checkpoint-file after every repo, so a "
-                             "killed run can be restarted with --resume and continue from where "
-                             "it left off instead of reprocessing everything. Repos are "
-                             "processed in a stable order (sorted by repo id) so the resume "
-                             "point is meaningful across separate runs. On a full run that "
-                             "completes (no --repo/--rows), the checkpoint is cleared. Only "
-                             "meaningful with --apply — dry runs don't write a checkpoint.")
     parser.add_argument("--checkpoint-file", default="sync_checkpoint.json",
-                        help="Path to the resume checkpoint (default: sync_checkpoint.json — "
-                             "same default name as gitlab_team_sync.py's, but the file is "
+                        help="Path to the resume checkpoint (default: sync_checkpoint.json). "
+                             "Every --apply run automatically writes progress here after each "
+                             "repo and checks it at startup — if it exists, the run resumes "
+                             "after that repo id instead of starting over; if not, it starts "
+                             "from the beginning as normal (this is what happens on a plain "
+                             "first-ever run). A full run that completes with no --repo/--rows "
+                             "filter clears the checkpoint. Dry runs never write it. Same "
+                             "default name as gitlab_team_sync.py's, but the file is "
                              "single-source: it's tagged with which source wrote it, and a run "
                              "for a DIFFERENT source ignores it as if no checkpoint existed. "
                              "This means the default path is NOT safe to share between a "
                              "concurrent GitHub run and GitLab run — each would overwrite the "
                              "other's progress. Pass distinct --checkpoint-file paths (e.g. "
                              "github_checkpoint.json / gitlab_checkpoint.json) if both sources "
-                             "run around the same time. Only used with --resume.")
+                             "run around the same time.")
 
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument("--dry-run", action="store_true", default=None,
@@ -1020,7 +1021,7 @@ def main():
     gh_reader = GitHubTeamReader(pat=gh_pat)
     sync(gh_reader, state, rows=args.rows, dry_run=dry_run, default_role=default_role, repo=args.repo,
          exceptions_file=args.exceptions_file, today=date.today().isoformat(),
-         resume=args.resume, checkpoint_file=args.checkpoint_file)
+         checkpoint_file=args.checkpoint_file)
 
 
 if __name__ == "__main__":
