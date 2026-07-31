@@ -931,11 +931,11 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  python github_team_sync.py --env env_github --ac-env /path/to/JulianSandbox/env\n"
-            "  python github_team_sync.py --env env_github --ac-env ../JulianSandbox/env --rows 5\n"
-            "  python github_team_sync.py --env env_github --ac-env ../JulianSandbox/env --repo owner/ac-sdk-v2\n"
-            "  python github_team_sync.py --env env_github --ac-env ../JulianSandbox/env --repo owner/ac-sdk-v2 --apply\n"
-            "  python github_team_sync.py --env env_github --ac-env ../JulianSandbox/env --apply\n"
+            "  python github_team_sync.py --env env_github --ac-env /path/to/myproject/env\n"
+            "  python github_team_sync.py --env env_github --ac-env ../myproject/env --rows 5\n"
+            "  python github_team_sync.py --env env_github --ac-env ../myproject/env --repo owner/ac-sdk-v2\n"
+            "  python github_team_sync.py --env env_github --ac-env ../myproject/env --repo owner/ac-sdk-v2 --apply\n"
+            "  python github_team_sync.py --env env_github --ac-env ../myproject/env --apply\n"
         ),
     )
     parser.add_argument("--env", default="env_github", help="Path to GitHub token env file (default: env_github)")

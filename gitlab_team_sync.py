@@ -212,7 +212,7 @@ class ArmorCodeClient:
         whether role is passed as a name, a /user/roles id, or a nested
         object — its expected role vocabulary could not be determined.
         This endpoint is the confirmed-working path (same one the ac-sdk-v2
-        SDK's update_user() uses), verified end-to-end against JulianSandbox.
+        SDK's update_user() uses), verified end-to-end against a live tenant.
         """
         resp = self._session.put(
             f"{self.base_url}/user/update/user",
@@ -746,7 +746,7 @@ def sync(gl_reader: GitLabTeamReader, state: ArmorCodeState, rows: int | None, d
                         # any member whose user already has "account level
                         # access" ("... cannot be added directly to Teams
                         # please update User access by updating user") —
-                        # confirmed against JulianSandbox, and every user this
+                        # confirmed against a live tenant, and every user this
                         # script creates hits that case. So team creation is
                         # scope-only; membership is always added afterward via
                         # add_user_to_team() (PUT /user/update/user), the same
@@ -890,11 +890,11 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  python gitlab_team_sync.py --env env_gitlab --ac-env /path/to/JulianSandbox/env\n"
-            "  python gitlab_team_sync.py --env env_gitlab --ac-env ../JulianSandbox/env --rows 5\n"
-            "  python gitlab_team_sync.py --env env_gitlab --ac-env ../JulianSandbox/env --repo juice-shop\n"
-            "  python gitlab_team_sync.py --env env_gitlab --ac-env ../JulianSandbox/env --repo juice-shop --apply\n"
-            "  python gitlab_team_sync.py --env env_gitlab --ac-env ../JulianSandbox/env --apply\n"
+            "  python gitlab_team_sync.py --env env_gitlab --ac-env /path/to/myproject/env\n"
+            "  python gitlab_team_sync.py --env env_gitlab --ac-env ../myproject/env --rows 5\n"
+            "  python gitlab_team_sync.py --env env_gitlab --ac-env ../myproject/env --repo juice-shop\n"
+            "  python gitlab_team_sync.py --env env_gitlab --ac-env ../myproject/env --repo juice-shop --apply\n"
+            "  python gitlab_team_sync.py --env env_gitlab --ac-env ../myproject/env --apply\n"
         ),
     )
     parser.add_argument("--env", default="env_gitlab", help="Path to GitLab token env file (default: env_gitlab)")
