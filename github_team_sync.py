@@ -40,7 +40,7 @@ skipped with a warning (nothing to scope the team to). If multiple match,
 all of them are added to the team's scope.
 
 Usage:
-    python github_team_sync.py --env env_github --ac-env /path/to/ac/env [--dry-run] [--rows N] [--repo owner/name]
+    python github_team_sync.py [--env envfile] [--dry-run] [--rows N] [--repo owner/name]
 
 Dry run is the default. Pass --apply to write changes to ArmorCode.
 """
@@ -934,24 +934,20 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  python github_team_sync.py --env env_github --ac-env /path/to/myproject/env\n"
-            "  python github_team_sync.py --env env_github --ac-env ../myproject/env --rows 5\n"
-            "  python github_team_sync.py --env env_github --ac-env ../myproject/env --repo owner/ac-sdk-v2\n"
-            "  python github_team_sync.py --env env_github --ac-env ../myproject/env --repo owner/ac-sdk-v2 --apply\n"
-            "  python github_team_sync.py --env env_github --ac-env ../myproject/env --apply\n"
+            "  python github_team_sync.py\n"
+            "  python github_team_sync.py --rows 10\n"
+            "  python github_team_sync.py --repo owner/ac-sdk-v2\n"
+            "  python github_team_sync.py --repo owner/ac-sdk-v2 --apply\n"
+            "  python github_team_sync.py --apply\n"
+            "  python github_team_sync.py --env /path/to/other/envfile --apply\n"
         ),
     )
-    parser.add_argument("--env", default="env_github",
-                        help="Path to the env file (default: env_github). Holds the GitHub token "
-                             "(GITHUB_PAT, or legacy token) and, unless --ac-env is given "
-                             "separately, the ArmorCode tenant token too (API_TOKEN / "
-                             "TENANT_URL) — a single file with both sets of keys works fine "
-                             "since they don't collide.")
+    parser.add_argument("--env", default="envfile",
+                        help="Path to the env file (default: envfile). Holds both the GitHub "
+                             "token (GITHUB_PAT) and the ArmorCode tenant token "
+                             "(API_TOKEN / TENANT_URL) — see env.example.")
     parser.add_argument("--ac-env", default=None,
-                        help="Path to the ArmorCode tenant env file (API_TOKEN / TENANT_URL, or "
-                             "legacy token/url). Defaults to the same file as --env — pass this "
-                             "only if you keep the GitHub and ArmorCode credentials in separate "
-                             "files.")
+                        help=argparse.SUPPRESS)
     parser.add_argument("--rows", type=int, default=None,
                         help="Limit to the first N GitHub repos (for testing)")
     parser.add_argument("--repo", default=None,
@@ -1002,12 +998,12 @@ def main():
     args = parser.parse_args()
     dry_run = not args.apply  # default True unless --apply passed
 
-    # --ac-env defaults to the same file as --env: the qualified key names
-    # (GITHUB_PAT vs API_TOKEN/TENANT_URL) don't collide, so one combined
-    # file works fine. Only the legacy bare "token"/"url" fallback keys are
-    # ambiguous across services — checked last, after every qualified key,
-    # precisely so a combined file's "token=" (meant for one service) can't
-    # be misread as the other service's credential.
+    # One env file holds everything: the qualified key names (GITHUB_PAT vs
+    # API_TOKEN/TENANT_URL) don't collide. The legacy bare "token"/"url"
+    # keys ARE ambiguous across services, so they're checked last, after
+    # every qualified key — that way a combined file's "token=" (meant for
+    # one service) can't be misread as the other's credential.
+    # --ac-env is a hidden escape hatch for split-credential setups.
     ac_env_path = args.ac_env or args.env
 
     gh_env = load_env_file(args.env)

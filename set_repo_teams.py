@@ -35,7 +35,7 @@ preserving non-team topics), useful when a CSV row represents "these are
 now the ONLY teams for this repo."
 
 Usage:
-    python set_repo_teams.py --csv teams.csv --gitlab-env env_gitlab --github-env env_github [--dry-run] [--apply]
+    python set_repo_teams.py --csv teams.csv [--dry-run] [--apply]
 
 Dry run is the default. Pass --apply to write changes.
 """
@@ -179,16 +179,16 @@ def main():
             "  github,jwayte-armorcode/add_jira_mappings,\"Ticketing;Support\"\n"
             "\n"
             "Examples:\n"
-            "  python set_repo_teams.py --csv teams.csv --gitlab-env env_gitlab --github-env env_github\n"
-            "  python set_repo_teams.py --csv teams.csv --gitlab-env env_gitlab --github-env env_github --apply\n"
-            "  python set_repo_teams.py --csv teams.csv --gitlab-env env_gitlab --github-env env_github --apply --replace-all-teams\n"
+            "  python set_repo_teams.py --csv teams.csv\n"
+            "  python set_repo_teams.py --csv teams.csv --apply\n"
+            "  python set_repo_teams.py --csv teams.csv --apply --replace-all-teams\n"
         ),
     )
     parser.add_argument("--csv", required=True, help="Path to the input CSV")
-    parser.add_argument("--gitlab-env", default="env_gitlab",
-                        help="GitLab token env file (only needed if the CSV has gitlab rows)")
-    parser.add_argument("--github-env", default="env_github",
-                        help="GitHub token env file (only needed if the CSV has github rows)")
+    parser.add_argument("--env", default="envfile",
+                        help="Path to the env file (default: envfile). Holds GITLAB_PAT / "
+                             "GITLAB_URL and/or GITHUB_PAT, depending on which sources the CSV "
+                             "references — see env.example.")
     parser.add_argument("--gitlab-url", default="https://gitlab.com",
                         help="GitLab instance URL (default: https://gitlab.com)")
     parser.add_argument("--replace-all-teams", action="store_true",
@@ -217,14 +217,18 @@ def main():
     print(f"\n{'='*60}\n  set_repo_teams ({'DRY RUN' if dry_run else 'APPLY'})\n{'='*60}\n")
     print(f"{len(rows)} row(s): {len(gitlab_rows)} gitlab, {len(github_rows)} github\n")
 
+    env = load_env_file(args.env)
+
     if gitlab_rows:
-        gl_env = load_env_file(args.gitlab_env)
-        gl_pat = gl_env.get("token2") or gl_env.get("GITLAB_PAT") or gl_env.get("token")
+        # Qualified keys first — a combined env file's bare "token" belongs to
+        # ArmorCode, so it must never be mistaken for the GitLab PAT.
+        gl_pat = env.get("GITLAB_PAT") or env.get("token2")
         if not gl_pat:
-            print(f"[error] no GitLab token found in {args.gitlab_env}, "
+            print(f"[error] no GitLab token found in {args.env} (expected GITLAB_PAT), "
                   f"but {len(gitlab_rows)} gitlab row(s) need one")
             sys.exit(1)
-        gl = gitlab.Gitlab(url=args.gitlab_url, private_token=gl_pat)
+        gl_url = env.get("GITLAB_URL") or args.gitlab_url
+        gl = gitlab.Gitlab(url=gl_url, private_token=gl_pat)
         gl.auth()
 
         print("[gitlab]")
@@ -233,10 +237,9 @@ def main():
             apply_gitlab(gl, row["repo"], row["teams"], args.replace_all_teams, dry_run)
 
     if github_rows:
-        gh_env = load_env_file(args.github_env)
-        gh_pat = gh_env.get("token") or gh_env.get("GITHUB_PAT")
+        gh_pat = env.get("GITHUB_PAT")
         if not gh_pat:
-            print(f"[error] no GitHub token found in {args.github_env}, "
+            print(f"[error] no GitHub token found in {args.env} (expected GITHUB_PAT), "
                   f"but {len(github_rows)} github row(s) need one")
             sys.exit(1)
         session = requests.Session()

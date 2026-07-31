@@ -248,8 +248,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--env",
-        default="env",
-        help="Path to env file (default: env)",
+        default="envfile",
+        help="Path to env file (default: envfile) — holds TENANT_URL/API_TOKEN plus "
+             "GITHUB_PAT and/or GITLAB_PAT. See env.example.",
     )
     parser.add_argument(
         "--create-missing-subproducts",

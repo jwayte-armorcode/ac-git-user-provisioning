@@ -1,4 +1,5 @@
 # Real credentials — never commit. Use env.example as the template.
+envfile
 env_gitlab
 env_github
 env

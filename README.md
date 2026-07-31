@@ -147,19 +147,28 @@ github,jwayte-armorcode/add_jira_mappings,"Ticketing;Support"
 
 ```bash
 # Dry run (default)
-python set_repo_teams.py --csv teams.csv --gitlab-env env_gitlab --github-env env_github
+python set_repo_teams.py --csv teams.csv
 
 # Apply for real — merges new team topics into what's already there
-python set_repo_teams.py --csv teams.csv --gitlab-env env_gitlab --github-env env_github --apply
+python set_repo_teams.py --csv teams.csv --apply
 
 # Replace a repo's team topics entirely with the CSV row's teams
 # (non-team topics like "javascript" are still preserved either way)
-python set_repo_teams.py --csv teams.csv --gitlab-env env_gitlab --github-env env_github --apply --replace-all-teams
+python set_repo_teams.py --csv teams.csv --apply --replace-all-teams
 ```
 
 ## Usage
 
-Each script reads a single `--env` file by default — one file holding both the SCM token and the ArmorCode tenant token, since the key names don't collide (`GITLAB_PAT`/`GITLAB_URL` or `GITHUB_PAT` for the SCM side, `API_TOKEN`/`TENANT_URL` for ArmorCode; see `env.example`). Pass `--ac-env` separately only if you keep the two sets of credentials in different files.
+Every script reads one env file, `envfile`, holding all credentials — the ArmorCode tenant token plus whichever SCM tokens you need. Copy `env.example` to `envfile` and fill it in; `envfile` is gitignored. Pass `--env /some/other/path` to use a different file.
+
+```
+# envfile
+TENANT_URL=https://app.armorcode.com
+API_TOKEN=your-armorcode-api-token
+GITLAB_PAT=glpat-...
+GITLAB_URL=https://gitlab.com
+GITHUB_PAT=github_pat_...
+```
 
 ### `sync.py`
 
@@ -174,7 +183,7 @@ python sync.py --source github --apply
 python sync.py --source all --dry-run
 
 # Use a non-default env file
-python sync.py --source gitlab --env ~/my-env --apply
+python sync.py --source gitlab --env ~/my-envfile --apply
 
 # Opt in to creating sub-products for repos with no existing match
 python sync.py --source gitlab --apply --create-missing-subproducts
@@ -183,33 +192,30 @@ python sync.py --source gitlab --apply --create-missing-subproducts
 ### `gitlab_team_sync.py` / `github_team_sync.py`
 
 ```bash
-# Dry run against every repo the token can see — one env file, both credential sets
-python gitlab_team_sync.py --env env_gitlab
-python github_team_sync.py --env env_github
+# Dry run against every repo the token can see
+python gitlab_team_sync.py
+python github_team_sync.py
 
 # One-off test against a single repo before trusting a full run
-python gitlab_team_sync.py --env env_gitlab --repo juice-shop
-python github_team_sync.py --env env_github --repo owner/ac-sdk-v2
+python gitlab_team_sync.py --repo juice-shop
+python github_team_sync.py --repo owner/ac-sdk-v2
 
 # Apply for real
-python gitlab_team_sync.py --env env_gitlab --repo juice-shop --apply
-python github_team_sync.py --env env_github --repo owner/ac-sdk-v2 --apply
+python gitlab_team_sync.py --repo juice-shop --apply
+python github_team_sync.py --repo owner/ac-sdk-v2 --apply
 
 # Full run on a very large tenant — checkpointing is automatic, no flag needed
-python github_team_sync.py --env env_github --apply
+python github_team_sync.py --apply
 
 # If it's killed partway through, run the EXACT same command again —
 # it reads sync_checkpoint.json and picks up right after the last completed repo id
-python github_team_sync.py --env env_github --apply
+python github_team_sync.py --apply
 
 # Override the default role assigned to newly-created ArmorCode users
-python gitlab_team_sync.py --env env_gitlab --apply --default-role "Security Engineer"
+python gitlab_team_sync.py --apply --default-role "Security Engineer"
 
 # After an admin fills in an email in email_exceptions.csv, provision that person
-python gitlab_team_sync.py --env env_gitlab --apply --reprocess-from-exceptions
-
-# If GitLab/GitHub and ArmorCode credentials live in separate files
-python gitlab_team_sync.py --env env_gitlab --ac-env /path/to/armorcode/env --apply
+python gitlab_team_sync.py --apply --reprocess-from-exceptions
 ```
 
 ## Testing on a subset of repos
@@ -218,13 +224,13 @@ Before trusting a full run on a real tenant, use `--rows N` to cap how many repo
 
 ```bash
 # Dry run against the first 10 repos only, for each source
-python gitlab_team_sync.py --env env_gitlab --rows 10
-python github_team_sync.py --env env_github --rows 10
+python gitlab_team_sync.py --rows 10
+python github_team_sync.py --rows 10
 
 # Same, but actually write to ArmorCode — good for an early "does this really work" check
 # on a small blast radius before running against the full tenant
-python gitlab_team_sync.py --env env_gitlab --rows 10 --apply
-python github_team_sync.py --env env_github --rows 10 --apply
+python gitlab_team_sync.py --rows 10 --apply
+python github_team_sync.py --rows 10 --apply
 
 # --rows and --repo can't usefully combine (--repo already limits to one repo);
 # use --rows for a broad small-scale smoke test, --repo for a single known repo
