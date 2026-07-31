@@ -38,6 +38,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import csv
 import sys
 from datetime import date, datetime
 
@@ -72,9 +73,27 @@ def build_reader(source: str, env: dict):
     return GitLabTeamReader(pat, url)
 
 
+UNMATCHED_CSV_COLUMNS = ["source", "repo", "expected_sub_product", "teams"]
+
+
+def write_unmatched_csv(path: str, rows: list[dict]) -> None:
+    """Write the unmatched-repo report, overwriting any previous one.
+
+    Overwrite rather than append: the file is a report of THIS run, so a
+    stale row from an earlier run (for a repo since fixed) would be
+    misleading. Written even when a run resumes from a checkpoint, in which
+    case it covers only the repos that run actually processed.
+    """
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=UNMATCHED_CSV_COLUMNS)
+        writer.writeheader()
+        for r in rows:
+            writer.writerow({col: r.get(col, "") for col in UNMATCHED_CSV_COLUMNS})
+
+
 def sync(reader, state: ArmorCodeState, rows: int | None, dry_run: bool,
          default_role: str, repo: str | None, exceptions_file: str, today: str,
-         checkpoint_file: str, sparse: bool = False):
+         checkpoint_file: str, sparse: bool = False, unmatched_csv: str | None = None):
     ac = state.ac
     source = reader.source
     mode = "DRY RUN" if dry_run else "APPLY"
@@ -103,8 +122,9 @@ def sync(reader, state: ArmorCodeState, rows: int | None, dry_run: bool,
     # Repos that carry a team topic but match no ArmorCode sub-product. Their
     # team and users are still provisioned; only the scope is missing, which
     # is easy to miss in a long log — so they're collected and re-listed in
-    # the summary as an actionable "create these sub-products" list.
-    unmatched_repos: list[str] = []
+    # the summary as an actionable "create these sub-products" list, and
+    # optionally written to CSV via --unmatched-csv.
+    unmatched_repos: list[dict] = []
 
     for scm_repo in reader.iter_repos(all_repos, rows=rows, after_id=after_id):
         repos_seen += 1
@@ -135,7 +155,12 @@ def sync(reader, state: ArmorCodeState, rows: int | None, dry_run: bool,
 
         sub_products = state.find_matching_sub_products(repo_name)
         if not sub_products:
-            unmatched_repos.append(f"{full_name} (looked for sub-product {repo_name!r})")
+            unmatched_repos.append({
+                "source": source,
+                "repo": full_name,
+                "expected_sub_product": repo_name,
+                "teams": ";".join(team_names),
+            })
             print(f"    [warn] no ArmorCode sub-product named {repo_name!r} found — "
                   f"team scope cannot be set for this repo (team/users still processed)")
         elif len(sub_products) > 1:
@@ -280,7 +305,17 @@ def sync(reader, state: ArmorCodeState, rows: int | None, dry_run: bool,
                   f"see them here)")
         else:
             for entry in unmatched_repos:
-                print(f"    - {entry}")
+                print(f"    - {entry['repo']} (looked for sub-product "
+                      f"{entry['expected_sub_product']!r}, teams: {entry['teams']})")
+        if unmatched_csv:
+            write_unmatched_csv(unmatched_csv, unmatched_repos)
+            print(f"\n  Written to {unmatched_csv}")
+    elif unmatched_csv:
+        # Nothing unmatched: still write a header-only CSV. Skipping the write
+        # would leave a previous run's file in place, reporting repos that
+        # have since been fixed as though they were still broken.
+        write_unmatched_csv(unmatched_csv, [])
+        print(f"\n  All matched — wrote empty {unmatched_csv}")
     print(f"{'='*70}\n")
 
     # A full, unfiltered, non-dry-run pass reached the end without being
@@ -402,6 +437,15 @@ def main():
                              "exists, the run resumes after that repo id instead of starting "
                              "over. A full run that completes with no --repo/--rows filter "
                              "clears it. Dry runs never write it.")
+    parser.add_argument("--unmatched-csv", nargs="?", const="unmatched_repos.csv",
+                        default=None, metavar="PATH",
+                        help="Also write the repos that had a team topic but no matching "
+                             "ArmorCode sub-product to a CSV (source, repo, "
+                             "expected_sub_product, teams). Pass the flag alone for "
+                             "unmatched_repos.csv, or give a path. Overwrites on each run, "
+                             "since it reports that run rather than accumulating history. "
+                             "Written in dry runs too, so it can be used to plan the missing "
+                             "sub-products before writing anything.")
     parser.add_argument("--sparse", action="store_true",
                         help="Condense logging to counts and summary lines, omitting the "
                              "per-user names and scope payloads printed by default. Applies "
@@ -486,7 +530,7 @@ def main():
     sync(reader, state, rows=args.rows, dry_run=dry_run, default_role=default_role,
          repo=args.repo, exceptions_file=exceptions_file,
          today=date.today().isoformat(), checkpoint_file=checkpoint_file,
-         sparse=args.sparse)
+         sparse=args.sparse, unmatched_csv=args.unmatched_csv)
 
 
 if __name__ == "__main__":

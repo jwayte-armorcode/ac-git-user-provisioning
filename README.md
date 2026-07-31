@@ -280,7 +280,25 @@ A repo's team scope comes from an ArmorCode sub-product whose name matches the r
 ======================================================================
 ```
 
-Each entry names the repo and the sub-product name that was searched for, so the fix is either creating that sub-product or correcting the repo's topic. Re-running afterwards attaches the scope — the sync never creates sub-products itself. The block is omitted entirely when everything matched, and `--sparse` shows just the count.
+Each entry names the repo, the sub-product name that was searched for, and the teams involved, so the fix is either creating that sub-product or correcting the repo's topic. Re-running afterwards attaches the scope — the sync never creates sub-products itself. The block is omitted entirely when everything matched, and `--sparse` shows just the count.
+
+For a machine-readable version, add `--unmatched-csv`:
+
+```bash
+# Writes unmatched_repos.csv
+python team_sync.py --source github --rows 10 --unmatched-csv
+
+# Or name the file
+python team_sync.py --source github --apply --unmatched-csv missing_subproducts.csv
+```
+
+```csv
+source,repo,expected_sub_product,teams
+github,acme-org/add_jira_mappings,add_jira_mappings,ticketing
+github,acme-org/ac-sdk-v2,ac-sdk-v2,api
+```
+
+The file reports that single run, so it's overwritten each time rather than appended — including a header-only file when everything matched, so a previous run's rows can't linger and misreport repos that have since been fixed. It's written in dry runs too, which makes `--rows N --unmatched-csv` a cheap way to plan the missing sub-products before writing anything. Note that a run resuming from a checkpoint only covers the repos it actually processed.
 
 One limitation: dry run reports what it *would* send, not whether that would change anything. `would merge scope entries` prints even when the team is already scoped to those sub-products — on an `--apply` run the same case prints `[noop] scope already covers these sub-products`. To see real change-vs-no-op, run with `--apply`.
 

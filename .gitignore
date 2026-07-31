@@ -11,6 +11,7 @@ env
 # --exceptions-file override.
 sync_checkpoint*.json
 email_exceptions*.csv
+unmatched_repos*.csv
 
 # Python
 __pycache__/
