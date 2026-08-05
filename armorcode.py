@@ -1,21 +1,29 @@
-"""ArmorCode client and state for team_sync.py.
+"""ArmorCode REST client and cached tenant state.
 
-The client is an inlined subset of ac-sdk-v2's armorcode/client.py, kept
-here so this tool has no dependency on the external SDK package. If you
-need other endpoints, port the corresponding method from
-ac-sdk-v2/armorcode/client.py rather than reintroducing that dependency.
+An inlined subset of ac-sdk-v2's armorcode/client.py, kept here so this tool
+has no dependency on the external SDK package. If you need other endpoints,
+port the corresponding method from ac-sdk-v2/armorcode/client.py rather than
+reintroducing that dependency.
 
-Several methods carry hard-won notes about API shape traps (read vs write
-shapes, membership living on the user record, endpoints that 500 on
-self-update). Read those docstrings before changing a request body.
+Several methods carry hard-won notes about API traps found by probing a live
+tenant, and they are the reason this file looks more defensive than a thin
+HTTP wrapper needs to:
+
+  - GET and PUT disagree about the shape of a team's scope; sending the read
+    shape back is a 400. See merge_scope_into_team().
+  - Team membership lives on the USER record, and the write replaces the
+    whole list. See add_user_to_team() / remove_user_from_team().
+  - /user/sub-product/elastic accepts a pageSize but IGNORES page, so a
+    paging loop silently duplicates rows. See get_sub_products_full().
+  - /user/update/user 500s on self-update, and rejects an empty teamInfo.
+  - Team names reject angle brackets. See matching.team_name_for_group().
+
+Read those docstrings before changing a request body.
 """
 
 from __future__ import annotations
 
-import configparser
-import sys
 import time
-from pathlib import Path
 from urllib.parse import urlsplit
 
 import requests
@@ -383,60 +391,18 @@ class ArmorCodeClient:
         return content
 
 
-# ---------------------------------------------------------------------------
-# Env loading
-# ---------------------------------------------------------------------------
-
-def load_env_file(path: str) -> dict:
-    """Parse a simple KEY=VALUE env file (lowercase or uppercase keys)."""
-    out = {}
-    p = Path(path)
-    if not p.exists():
-        print(f"[error] env file not found: {path}")
-        sys.exit(1)
-    for line in p.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        k, v = line.split("=", 1)
-        out[k.strip()] = v.strip().strip('"').strip("'")
-    return out
-
-
-DEFAULT_ROLE = "Developer"
-
-
-def load_default_role(config_path: str, cli_override: str | None,
-                      source: str | None = None) -> str:
-    """Resolve the ArmorCode tenantRole for newly-created users.
-
-    Precedence: --default-role CLI flag > [<source>] default_role >
-    [armorcode] default_role > built-in default ("Developer").
-
-    The per-source section ([github] / [gitlab]) lets one config file give
-    each SCM a different role; [armorcode] is the shared fallback for the
-    common case where both should match. A missing ini file is not an
-    error — it's an optional override, not a requirement.
-    """
-    if cli_override:
-        return cli_override
-
-    p = Path(config_path)
-    if p.exists():
-        parser = configparser.ConfigParser()
-        parser.read(p)
-        for section in ([source] if source else []) + ["armorcode"]:
-            if parser.has_option(section, "default_role"):
-                return parser.get(section, "default_role").strip()
-
-    return DEFAULT_ROLE
-
 class ArmorCodeState:
-    """Caches ArmorCode teams/users/sub-products so we don't re-fetch per repo."""
+    """Caches the tenant's teams, users and business unit for one run.
+
+    Sub-products are deliberately NOT loaded here any more: matching is done
+    by repository URL against the bulk /user/sub-product/elastic response
+    (see matching.SubProductIndex), so a name-keyed sub-product index would
+    be a second, unused copy of the same data.
+    """
 
     def __init__(self, ac: ArmorCodeClient):
         self.ac = ac
-        print("[armorcode] Loading teams, users, sub-products, business units...")
+        print("[armorcode] Loading teams, users, business units...")
 
         # Business unit ids are tenant-specific — never hardcode one. Resolve
         # the tenant's actual default org by name; fall back to whichever
@@ -452,9 +418,7 @@ class ArmorCodeState:
         self.business_unit_name = default_bu["name"]
         print(f"[armorcode] Using business unit: {self.business_unit_name!r} (id={self.business_unit_id})")
 
-        # Keyed by exact name AND lowercased name — see find_team()/register_team()
-        # for why: GitHub topics are lowercase-only, so a topic-derived team
-        # name (e.g. "api") must still match an existing team named "API".
+        # Keyed by exact name AND lowercased name — see find_team().
         self.teams_by_name: dict[str, dict] = {}
         for t in ac.get_teams():
             self.register_team(t)
@@ -465,27 +429,18 @@ class ArmorCodeState:
             if email:
                 self.users_by_email[email] = u
 
-        # sub-products: name (lowercased) -> list of {id, name} (may be >1)
-        self.sub_products_by_name: dict[str, list[dict]] = {}
-        for sp in ac.get_sub_products():
-            key = sp["name"].strip().lower()
-            self.sub_products_by_name.setdefault(key, []).append(sp)
-
-        print(
-            f"[armorcode] {len(self.teams_by_name)} teams, "
-            f"{len(self.users_by_email)} users with email, "
-            f"{sum(len(v) for v in self.sub_products_by_name.values())} sub-products"
-        )
+        print(f"[armorcode] {len(self.teams_by_name)} team keys, "
+              f"{len(self.users_by_email)} users with email")
 
     # -- team lookup (case-insensitive) -----------------------------------
 
     def find_team(self, team_name: str) -> dict | None:
         """Look up a team by name, case-insensitively.
 
-        GitHub topics are forced lowercase (e.g. "armorcode-team-api"), so
-        the team name parsed from a topic must still match an existing
-        team named e.g. "API" — exact-match lookup would miss it and
-        create a duplicate "api" team instead.
+        Case-insensitive so a Group-derived name matches an existing team
+        that differs only in case — e.g. a Group named "api" should adopt an
+        existing team "API" rather than creating a near-duplicate alongside
+        it. Exact match is tried first, so an exact hit always wins.
         """
         return self.teams_by_name.get(team_name) or self.teams_by_name.get(team_name.lower())
 
