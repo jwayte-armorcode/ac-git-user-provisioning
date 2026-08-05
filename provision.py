@@ -32,6 +32,7 @@ import config
 import email_exceptions
 import extract_store
 import model
+import snapshot
 from armorcode import (
     ArmorCodeClient,
     ArmorCodeState,
@@ -266,6 +267,10 @@ def main():
                         help="Proceed despite unusable extracts or an implausibly "
                              "high unmatched rate. Both guards exist to catch "
                              "broken input; override only when you know why.")
+    parser.add_argument("--no-snapshot", action="store_true",
+                        help="Skip the pre-write snapshot. Not recommended: the "
+                             "snapshot is what restore.py rebuilds from if a run "
+                             "turns out to be wrong.")
 
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", action="store_true", default=None,
@@ -373,11 +378,23 @@ def main():
         print("\n[done] no teams to provision")
         return
 
+    # Snapshot before the first write, never on a dry run (nothing to undo).
+    # This is the recovery point if a run turns out to have done the wrong
+    # thing — see restore.py.
+    if not dry_run and not args.no_snapshot:
+        snapshot.take_snapshot(ac, cfg.armorcode_url, cfg.snapshots.path,
+                               command="provision.py --apply")
+
     state = ArmorCodeState(ac)
     user_records = provision_users(ac, state, agg, default_role, dry_run)
     from datetime import date
     stats = provision_teams(ac, state, agg, user_records, default_role, dry_run,
                             args.limit, args.exceptions_file, date.today().isoformat())
+
+    # Pruned only after the run succeeded, so a failure can't expire the
+    # snapshot that would be needed to recover from it.
+    if not dry_run and not args.no_snapshot:
+        snapshot.prune(cfg.snapshots.path, cfg.snapshots.retention_days)
 
     print(f"\n{'='*70}")
     if dry_run:
