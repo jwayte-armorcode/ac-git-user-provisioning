@@ -327,6 +327,61 @@ class ArmorCodeClient:
         resp.raise_for_status()
         return resp.json()
 
+    def get_sub_products_full(self):
+        """Every sub-product WITH repoLink and parent product, in one call.
+
+        This is the endpoint the whole matching model depends on. Unlike
+        /user/sub-product/elastic/short (id + name only), the un-suffixed
+        /user/sub-product/elastic returns the fields needed to:
+
+          - match a repo by URL          -> repoLink, repoType
+          - name the team from its Group -> parentName
+          - scope the team               -> parent (product id)
+
+        So the URL->sub-product map AND every team name cost one request
+        rather than one per sub-product. On a 20,000 sub-product tenant,
+        paced at 0.6s, the per-sub-product alternative would be over three
+        hours before any real work started.
+
+        Called with NO query parameters, deliberately. Probing a live tenant
+        showed the endpoint has two modes, and only this one is usable:
+
+          - no `pageSize`  -> returns a bare JSON list of EVERY sub-product,
+                              ignoring `page`, `size` and `pageNumber`.
+          - with `pageSize` -> returns a Spring page envelope, capped at
+                              `pageSize <= 100` ... but `page` is IGNORED:
+                              page=0 and page=1 both return the first N
+                              records. Iterating it would loop on page 0 and
+                              silently duplicate rows forever.
+
+        Hence the unpaged form. A page envelope coming back anyway (should
+        the API change) is unwrapped rather than mistaken for a list, and
+        `content` alone would be a truncated view, so that case warns.
+
+        Note ids come back as STRINGS here but as ints from
+        /api/sub-product/{id}. Callers must coerce — matching.SubProductRef
+        does.
+        """
+        resp = self._session.get(
+            f"{self.base_url}/user/sub-product/elastic", timeout=self._timeout,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        if isinstance(data, list):
+            return data
+
+        # Defensive: the API started paginating this response. Take what we
+        # can and say so loudly — a silently truncated sub-product list means
+        # repos stop matching, which under reconcile means people lose access.
+        content = data.get("content") or []
+        total = data.get("totalElements")
+        if total is not None and len(content) < total:
+            print(f"    [warn] /user/sub-product/elastic returned a paged response "
+                  f"({len(content)} of {total}). The sub-product list is INCOMPLETE, "
+                  f"so some repos will not match. Do not reconcile from this run.")
+        return content
+
 
 # ---------------------------------------------------------------------------
 # Env loading
@@ -594,4 +649,44 @@ def add_user_to_team(ac: ArmorCodeClient, user_record: dict, team_id: int, role:
     team_info.append({"teamId": team_id, "role": role})
     updated = ac.update_user_team_info(user_id, team_info)
     user_record["teamInfo"] = updated.get("teamInfo", team_info)
+    return True
+
+
+class LastTeamError(Exception):
+    """Raised when removing a team would leave a user with no teams at all.
+
+    PUT /user/update/user rejects an empty teamInfo — a user must belong to
+    at least one team — so this case has to be detected and reported rather
+    than attempted. The user stays where they are and the operator decides:
+    delete the user, or move them to another team first.
+    """
+
+
+def remove_user_from_team(ac: ArmorCodeClient, user_record: dict, team_id: int) -> bool:
+    """Remove one user from one team, keeping every other membership.
+
+    The mirror image of add_user_to_team(): membership lives on the USER
+    record, and PUT /user/update/user replaces the whole teamInfo list, so
+    this GET-merges by filtering rather than assigning.
+
+    Returns True if a removal was written, False if the user was not on the
+    team (no-op, no request made). Raises LastTeamError if this is the
+    user's only team — the API forbids an empty teamInfo, so the caller must
+    surface it instead of silently failing.
+    """
+    user_id = user_record.get("userId") or user_record["id"]
+    team_info = list(user_record.get("teamInfo") or [])
+
+    remaining = [t for t in team_info if t.get("teamId") != team_id]
+    if len(remaining) == len(team_info):
+        return False  # not a member; nothing to do
+
+    if not remaining:
+        raise LastTeamError(
+            f"user {user_record.get('email') or user_id} is only on this team; "
+            f"ArmorCode requires at least one team membership"
+        )
+
+    updated = ac.update_user_team_info(user_id, remaining)
+    user_record["teamInfo"] = updated.get("teamInfo", remaining)
     return True
