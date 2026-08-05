@@ -1,23 +1,40 @@
 # Real credentials — never commit. Use env.example as the template.
+# envfile is now an ini file holding the ArmorCode tenant AND every SCM's
+# token, so any variant of the name is excluded.
 envfile
+envfile.*
 env_gitlab
 env_github
 env
 *.env
 
-# Runtime state — regenerated per run, not source. Both are per-source by
-# default (sync_checkpoint_github.json, email_exceptions_gitlab.csv, ...);
-# the bare names are the pre-split defaults and any --checkpoint-file /
-# --exceptions-file override.
-sync_checkpoint*.json
-*-repos.csv
-*-repos-changed.csv
-apply_cache_*.json
-email_exceptions*.csv
-unmatched_repos*.csv
+# Runtime state — regenerated per run, not source.
+#
+# Per-SCM extract directories are named for the mnemonic in the config, so
+# their names aren't known up front; the files inside them are matched by
+# name instead. They hold member names and emails, which must never enter
+# git history.
+*/repos.json
+*/extract_meta.json
 repos.json
 users.json
 teams.json
+
+# Pre-write snapshots of teams and memberships. Contain emails; retained
+# locally for restore, never committed.
+snapshots/
+
+# Reports and caches
+apply_cache_*.json
+email_exceptions*.csv
+unmatched_repos*.csv
+reconcile_report*.csv
+provision_report*.json
+
+# Legacy runtime state from the topic-based sync
+sync_checkpoint*.json
+*-repos.csv
+*-repos-changed.csv
 
 # Python
 __pycache__/
